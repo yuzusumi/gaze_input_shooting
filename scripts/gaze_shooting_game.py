@@ -1,8 +1,10 @@
 import argparse
 import csv
+import math
 import random
 import time
 from collections import Counter, deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +35,58 @@ AREA_LABELS = {
     3: "RIGHT DOWN",
 }
 
+DIRECTION_LABELS = AREA_LABELS
+BAD_FISH_PENALTY = -10
+BAD_FISH_SPAWN_SEC = 5.0
+BAD_FISH_BOUNCE_JITTER_DEG = 38
+
+FISH_TYPES = [
+    {
+        "name": "Goldfish",
+        "score": 10,
+        "is_bad": False,
+        "speed": 185,
+        "body_color": (55, 150, 255),
+        "tail_color": (35, 105, 255),
+        "accent_color": (255, 245, 215),
+        "radius_scale": 1.00,
+        "chance": 0.58,
+    },
+    {
+        "name": "Red Goldfish",
+        "score": 20,
+        "is_bad": False,
+        "speed": 245,
+        "body_color": (45, 45, 235),
+        "tail_color": (30, 30, 190),
+        "accent_color": (255, 230, 230),
+        "radius_scale": 0.95,
+        "chance": 0.29,
+    },
+    {
+        "name": "Rare Fish",
+        "score": 50,
+        "is_bad": False,
+        "speed": 330,
+        "body_color": (235, 215, 80),
+        "tail_color": (245, 180, 35),
+        "accent_color": (255, 255, 255),
+        "radius_scale": 0.82,
+        "chance": 0.13,
+    },
+    {
+        "name": "Bad Fish",
+        "score": BAD_FISH_PENALTY,
+        "is_bad": True,
+        "speed": 230,
+        "body_color": (70, 70, 90),
+        "tail_color": (35, 35, 55),
+        "accent_color": (60, 60, 220),
+        "radius_scale": 1.05,
+        "chance": 0.0,
+    },
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -47,9 +101,12 @@ def parse_args():
     parser.add_argument("--calib-sec", type=float, default=5.0)
     parser.add_argument("--ignore-sec", type=float, default=1.0)
     parser.add_argument("--game-sec", type=float, default=30.0)
-    parser.add_argument("--hit-effect-sec", type=float, default=0.30)
+    parser.add_argument("--hit-effect-sec", type=float, default=0.65)
     parser.add_argument("--target-life-sec", type=float, default=5.0)
     parser.add_argument("--target-overlap-sec", type=float, default=3.0)
+    parser.add_argument("--fish-spawn-sec", type=float, default=0.75)
+    parser.add_argument("--max-fish", type=int, default=11)
+    parser.add_argument("--poi-radius", type=int, default=118)
     parser.add_argument("--bonus-chance", type=float, default=0.20)
     parser.add_argument("--normal-score", type=int, default=1)
     parser.add_argument("--bonus-score", type=int, default=3)
@@ -335,26 +392,27 @@ def draw_grid(screen):
 
 def draw_wait_screen(w, h, radius):
     screen = np.zeros((h, w, 3), dtype=np.uint8)
-    draw_grid(screen)
+    draw_water_background(screen)
     cx, cy = w // 2, h // 2
     r = scaled(radius, 1080, h)
 
-    cv2.circle(screen, (cx, cy), r + scaled(14, 1080, h), (255, 255, 255), scaled(4, 1080, h), cv2.LINE_AA)
+    cv2.circle(screen, (cx, cy), r + scaled(14, 1080, h), (0, 255, 255), scaled(4, 1080, h), cv2.LINE_AA)
     cv2.circle(screen, (cx, cy), r, (255, 255, 255), -1, cv2.LINE_AA)
 
-    draw_centered_text(screen, "Look at the center dot", scaled(120, 1080, h), scale=1.5 * h / 1080, thickness=scaled(4, 1080, h))
-    draw_centered_text(screen, "Press Enter to start", scaled(185, 1080, h), color=(0, 255, 255), scale=1.0 * h / 1080, thickness=scaled(3, 1080, h))
-    draw_centered_text(screen, "Press q to quit", scaled(235, 1080, h), scale=0.85 * h / 1080, thickness=scaled(2, 1080, h))
+    draw_centered_text(screen, "KINGYO SUKUI GAZE GAME", scaled(120, 1080, h), color=(0, 255, 255), scale=1.5 * h / 1080, thickness=scaled(4, 1080, h))
+    draw_centered_text(screen, "Look at the center dot, then press Enter", scaled(185, 1080, h), scale=0.95 * h / 1080, thickness=scaled(3, 1080, h))
+    draw_centered_text(screen, "Catch fish by looking at a poi and blinking", scaled(245, 1080, h), color=(255, 255, 255), scale=0.85 * h / 1080, thickness=scaled(2, 1080, h))
+    draw_centered_text(screen, "Press q to quit", h - scaled(80, 1080, h), scale=0.85 * h / 1080, thickness=scaled(2, 1080, h))
     return screen
 
 
 def draw_calibration_screen(w, h, radius, remain_sec, elapsed, ignore_sec):
     screen = np.zeros((h, w, 3), dtype=np.uint8)
-    draw_grid(screen)
+    draw_water_background(screen)
     cx, cy = w // 2, h // 2
     r = scaled(radius, 1080, h)
 
-    cv2.circle(screen, (cx, cy), r + scaled(14, 1080, h), (255, 255, 255), scaled(4, 1080, h), cv2.LINE_AA)
+    cv2.circle(screen, (cx, cy), r + scaled(14, 1080, h), (0, 255, 255), scaled(4, 1080, h), cv2.LINE_AA)
     cv2.circle(screen, (cx, cy), r, (255, 255, 255), -1, cv2.LINE_AA)
 
     if elapsed < ignore_sec:
@@ -430,140 +488,387 @@ def get_enemy_color(name):
     return colors.get(name, (255, 255, 0))
 
 
-def choose_next_target(exclude_areas=None):
-    """除外領域を避けて、次の的の領域を選ぶ。
+@dataclass
+class Fish:
+    fish_type: dict
+    x: float
+    y: float
+    vx: float
+    vy: float
+    radius: int
+    wobble_seed: float
 
-    exclude_areas で全領域が埋まっている場合だけ、重なりを許して選ぶ。
-    通常運用では最大2体までなので、ここで重なることはない。
-    """
-    all_areas = [0, 1, 2, 3]
-    exclude_areas = set(exclude_areas or [])
-    candidates = [area for area in all_areas if area not in exclude_areas]
-    if not candidates:
-        candidates = all_areas
-    return random.choice(candidates)
+    @property
+    def score(self):
+        return int(self.fish_type["score"])
+
+    @property
+    def name(self):
+        return self.fish_type["name"]
+
+    @property
+    def is_bad(self):
+        return bool(self.fish_type.get("is_bad", False))
+
+    def update(self, dt, w, h):
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        bounced = False
+
+        margin = max(self.radius + 10, scaled(42, 1080, h))
+        if self.x < margin:
+            self.x = margin
+            self.vx = abs(self.vx)
+            bounced = True
+        elif self.x > w - margin:
+            self.x = w - margin
+            self.vx = -abs(self.vx)
+            bounced = True
+
+        top_margin = max(self.radius + 10, scaled(112, 1080, h))
+        bottom_margin = max(self.radius + 10, scaled(70, 1080, h))
+        if self.y < top_margin:
+            self.y = top_margin
+            self.vy = abs(self.vy)
+            bounced = True
+        elif self.y > h - bottom_margin:
+            self.y = h - bottom_margin
+            self.vy = -abs(self.vy)
+            bounced = True
+
+        if bounced and self.is_bad:
+            self.randomize_bounce_angle()
+
+    def randomize_bounce_angle(self):
+        speed = max(1.0, math.hypot(self.vx, self.vy))
+        angle = math.atan2(self.vy, self.vx)
+        angle += math.radians(random.uniform(-BAD_FISH_BOUNCE_JITTER_DEG, BAD_FISH_BOUNCE_JITTER_DEG))
+        self.vx = math.cos(angle) * speed
+        self.vy = math.sin(angle) * speed
 
 
-def spawn_target(exclude_areas, args):
-    area = choose_next_target(exclude_areas)
-    bonus_chance = min(1.0, max(0.0, float(args.bonus_chance)))
-    return {
-        "area": area,
-        "is_bonus": random.random() < bonus_chance,
-        "spawn_time": time.perf_counter(),
-    }
+def choose_fish_type(include_bad=False, bad_only=False):
+    candidates = FISH_TYPES
+    if bad_only:
+        candidates = [fish_type for fish_type in FISH_TYPES if fish_type.get("is_bad", False)]
+    elif not include_bad:
+        candidates = [fish_type for fish_type in FISH_TYPES if not fish_type.get("is_bad", False)]
+
+    r = random.random()
+    acc = 0.0
+    for fish_type in candidates:
+        acc += fish_type["chance"]
+        if r <= acc:
+            return fish_type
+    return candidates[-1]
 
 
-def update_targets(targets, args):
-    """的を更新する。
+def spawn_fish(w, h, bad_only=False):
+    fish_type = choose_fish_type(bad_only=bad_only)
+    cx = w * 0.5 + random.uniform(-w * 0.08, w * 0.08)
+    cy = h * 0.52 + random.uniform(-h * 0.08, h * 0.08)
+    angle = random.uniform(0.0, math.tau)
+    speed = scaled(fish_type["speed"], 1080, h) * random.uniform(0.88, 1.15)
+    radius = max(18, int(scaled(42, 1080, h) * fish_type["radius_scale"]))
+    return Fish(
+        fish_type=fish_type,
+        x=cx,
+        y=cy,
+        vx=math.cos(angle) * speed,
+        vy=math.sin(angle) * speed,
+        radius=radius,
+        wobble_seed=random.uniform(0.0, math.tau),
+    )
 
-    仕様:
-    - 的は最大2体まで。
-    - 各的は5秒で消える。
-    - 的が1体だけで、その的が3秒以上残っていれば、別位置に2体目を出す。
-    - 表示中の的と同じ領域には新しい的を出さない。
-    """
+
+def update_fish(fishes, dt, w, h, args, last_spawn_time, last_bad_spawn_time):
+    max_fish = max(1, int(args.max_fish))
+    spawn_sec = max(0.25, float(args.fish_spawn_sec))
     now = time.perf_counter()
-    life_sec = max(0.1, float(args.target_life_sec))
-    overlap_sec = max(0.0, min(float(args.target_overlap_sec), life_sec))
-    max_targets = 2
 
-    # 先に5秒経過した的を消す。
-    targets[:] = [t for t in targets if now - t["spawn_time"] < life_sec]
+    for fish in fishes:
+        fish.update(dt, w, h)
 
-    # 念のため、同じ領域に複数の的がある場合は新しい方を残して整理する。
-    unique_by_area = {}
-    for target in targets:
-        area = target["area"]
-        if area not in unique_by_area or target["spawn_time"] > unique_by_area[area]["spawn_time"]:
-            unique_by_area[area] = target
-    targets[:] = sorted(unique_by_area.values(), key=lambda t: t["spawn_time"])[:max_targets]
+    if len(fishes) < max_fish and now - last_spawn_time >= spawn_sec:
+        fishes.append(spawn_fish(w, h))
+        last_spawn_time = now
 
-    # すべて消えた場合は1体出す。
-    if not targets:
-        targets.append(spawn_target([], args))
-        return targets
+    if len(fishes) < max_fish and now - last_bad_spawn_time >= BAD_FISH_SPAWN_SEC:
+        fishes.append(spawn_fish(w, h, bad_only=True))
+        last_bad_spawn_time = now
 
-    # 的が1体だけ、かつ3秒以上経過していれば、別位置に2体目を出す。
-    if len(targets) < max_targets:
-        oldest = min(targets, key=lambda t: t["spawn_time"])
-        if now - oldest["spawn_time"] >= overlap_sec:
-            active_areas = [t["area"] for t in targets]
-            targets.append(spawn_target(active_areas, args))
+    if not fishes:
+        fishes.append(spawn_fish(w, h))
+        last_spawn_time = now
 
-    # 念のため最大2体に制限する。
-    targets[:] = sorted(targets, key=lambda t: t["spawn_time"])[:max_targets]
-    return targets
+    return last_spawn_time, last_bad_spawn_time
 
 
-def draw_enemy_mark(screen, area_id, args, is_bonus=False):
+def get_poi_center(w, h, direction):
+    return get_area_center(w, h, direction)
+
+
+def get_poi_radius(h, args):
+    return scaled(args.poi_radius, 1080, h)
+
+
+def fish_in_poi(fish, w, h, direction, args):
+    px, py = get_poi_center(w, h, direction)
+    catch_radius = get_poi_radius(h, args) + fish.radius * 0.45
+    return math.hypot(fish.x - px, fish.y - py) <= catch_radius
+
+
+def draw_water_background(screen):
     h, w = screen.shape[:2]
-    cx, cy = get_area_center(w, h, area_id)
-    color = (0, 255, 255) if is_bonus else get_enemy_color(args.enemy_color)
-    r = scaled(args.enemy_radius, 1080, h)
-    if is_bonus:
-        r = int(r * 1.15)
-    cross = int(r * 0.65)
-    th = scaled(7, 1080, h)
+    top = np.array([105, 70, 28], dtype=np.float32)
+    bottom = np.array([185, 135, 55], dtype=np.float32)
+    for y in range(h):
+        t = y / max(1, h - 1)
+        color = (top * (1.0 - t) + bottom * t).astype(np.uint8)
+        screen[y, :] = color
 
-    cv2.circle(screen, (cx, cy), r, color, th, cv2.LINE_AA)
-    cv2.line(screen, (cx - cross, cy), (cx + cross, cy), color, th, cv2.LINE_AA)
-    cv2.line(screen, (cx, cy - cross), (cx, cy + cross), color, th, cv2.LINE_AA)
+    wave_color = (215, 190, 120)
+    for i, y in enumerate(range(scaled(120, 1080, h), h, scaled(130, 1080, h))):
+        phase = i * scaled(72, 1920, w)
+        pts = []
+        for x in range(-scaled(80, 1920, w), w + scaled(80, 1920, w), scaled(36, 1920, w)):
+            yy = int(y + math.sin((x + phase) / max(1, scaled(90, 1920, w))) * scaled(12, 1080, h))
+            pts.append((x, yy))
+        cv2.polylines(screen, [np.array(pts, dtype=np.int32)], False, wave_color, scaled(2, 1080, h), cv2.LINE_AA)
 
-    if is_bonus:
-        cv2.circle(screen, (cx, cy), int(r * 1.28), color, scaled(3, 1080, h), cv2.LINE_AA)
-        draw_centered_text(screen, "+3", cy + r + scaled(58, 1080, h), color=color, scale=0.9 * h / 1080, thickness=scaled(3, 1080, h))
+    cv2.circle(screen, (w // 2, h // 2), scaled(92, 1080, h), (210, 175, 105), scaled(3, 1080, h), cv2.LINE_AA)
 
 
-def draw_gaze_area_frame(screen, area_id, blink=False):
-    if area_id is None:
-        return
+def draw_poi(screen, direction, args, selected=False, blink=False, broken=False):
     h, w = screen.shape[:2]
-    x1, y1, x2, y2 = get_area_rect(w, h, area_id)
-    margin = scaled(10, 1080, h)
-    th = scaled(8, 1080, h)
+    cx, cy = get_poi_center(w, h, direction)
+    r = get_poi_radius(h, args)
+    th = scaled(5, 1080, h)
+    color = (255, 255, 255)
+    rim = (0, 255, 255) if selected else (235, 235, 220)
+    if broken:
+        color = (120, 135, 135)
+        rim = (95, 95, 95)
+    if blink and selected and not broken:
+        rim = (255, 0, 255)
+    if selected:
+        r = int(r * 1.13)
+        th = scaled(9, 1080, h)
 
-    # 通常時は白枠、瞬き検出中だけマゼンタ枠にする。
-    # BGR: white=(255,255,255), magenta=(255,0,255)
-    color = (255, 0, 255) if blink else (255, 255, 255)
+    cv2.circle(screen, (cx, cy), r, rim, th, cv2.LINE_AA)
+    cv2.circle(screen, (cx, cy), int(r * 0.78), color, scaled(2, 1080, h), cv2.LINE_AA)
+    for i in range(-2, 3):
+        offset = i * r // 5
+        cv2.line(screen, (cx - r + scaled(16, 1080, h), cy + offset), (cx + r - scaled(16, 1080, h), cy + offset), (220, 235, 235), 1, cv2.LINE_AA)
+        cv2.line(screen, (cx + offset, cy - r + scaled(16, 1080, h)), (cx + offset, cy + r - scaled(16, 1080, h)), (220, 235, 235), 1, cv2.LINE_AA)
 
-    cv2.rectangle(
+    if broken:
+        x_size = int(r * 0.72)
+        cv2.line(screen, (cx - x_size, cy - x_size), (cx + x_size, cy + x_size), (40, 40, 230), scaled(8, 1080, h), cv2.LINE_AA)
+        cv2.line(screen, (cx + x_size, cy - x_size), (cx - x_size, cy + x_size), (40, 40, 230), scaled(8, 1080, h), cv2.LINE_AA)
+        (bw, _), _ = cv2.getTextSize("BROKEN", cv2.FONT_HERSHEY_SIMPLEX, 0.72 * h / 1080, scaled(3, 1080, h))
+        cv2.putText(
+            screen,
+            "BROKEN",
+            (cx - bw // 2, cy + scaled(12, 1080, h)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72 * h / 1080,
+            (40, 40, 230),
+            scaled(3, 1080, h),
+            cv2.LINE_AA,
+        )
+
+    label = DIRECTION_LABELS[direction]
+    (tw, th_text), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.9 * h / 1080, scaled(3, 1080, h))
+    cv2.putText(
         screen,
-        (x1 + margin, y1 + margin),
-        (x2 - margin, y2 - margin),
-        color,
-        th,
+        label,
+        (cx - tw // 2, cy + r + th_text + scaled(22, 1080, h)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9 * h / 1080,
+        rim,
+        scaled(3, 1080, h),
         cv2.LINE_AA,
     )
 
 
-def draw_game_screen(w, h, targets, gaze_area, score, remain_sec, args,
-                     blink=False, head_warning=False, hit_area=None, hit_visible=False):
+def draw_all_pois(screen, selected_direction, args, blink=False, broken_pois=None):
+    broken_pois = broken_pois or set()
+    for direction in (0, 1, 2, 3):
+        draw_poi(
+            screen,
+            direction,
+            args,
+            selected=(direction == selected_direction),
+            blink=blink,
+            broken=direction in broken_pois,
+        )
+
+
+def draw_fish(screen, fish, now):
+    h, _ = screen.shape[:2]
+    angle = math.degrees(math.atan2(fish.vy, fish.vx))
+    wiggle = math.sin(now * 8.0 + fish.wobble_seed) * 8.0
+    body_r = fish.radius
+    cx, cy = int(fish.x), int(fish.y)
+    body_color = fish.fish_type["body_color"]
+    tail_color = fish.fish_type["tail_color"]
+    accent_color = fish.fish_type["accent_color"]
+
+    theta = math.atan2(fish.vy, fish.vx)
+    back_x = fish.x - math.cos(theta) * body_r * 1.18
+    back_y = fish.y - math.sin(theta) * body_r * 1.18
+    side_x = math.cos(theta + math.pi / 2.0)
+    side_y = math.sin(theta + math.pi / 2.0)
+    tail_len = body_r * 1.08
+    tail_w = body_r * 0.78
+    tail_tip = (int(back_x - math.cos(theta) * tail_len), int(back_y - math.sin(theta) * tail_len))
+    tail_pts = np.array([
+        tail_tip,
+        (int(back_x + side_x * tail_w), int(back_y + side_y * tail_w)),
+        (int(back_x - side_x * tail_w), int(back_y - side_y * tail_w)),
+    ], dtype=np.int32)
+    cv2.fillConvexPoly(screen, tail_pts, tail_color, cv2.LINE_AA)
+
+    cv2.ellipse(
+        screen,
+        (cx, cy),
+        (int(body_r * 1.15), int(body_r * 0.68)),
+        angle + wiggle,
+        0,
+        360,
+        body_color,
+        -1,
+        cv2.LINE_AA,
+    )
+    cv2.ellipse(
+        screen,
+        (cx, cy),
+        (int(body_r * 0.72), int(body_r * 0.38)),
+        angle + wiggle,
+        0,
+        360,
+        accent_color,
+        scaled(3, 1080, h),
+        cv2.LINE_AA,
+    )
+
+    eye_x = int(fish.x + math.cos(theta) * body_r * 0.62 + side_x * body_r * 0.25)
+    eye_y = int(fish.y + math.sin(theta) * body_r * 0.62 + side_y * body_r * 0.25)
+    cv2.circle(screen, (eye_x, eye_y), max(3, body_r // 8), (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(screen, (eye_x, eye_y), max(2, body_r // 14), (20, 20, 20), -1, cv2.LINE_AA)
+
+    if fish.is_bad:
+        mark_scale = 0.9 * h / 1080
+        mark_th = scaled(3, 1080, h)
+        cv2.putText(
+            screen,
+            "!!",
+            (cx - body_r // 2, cy - body_r - scaled(18, 1080, h)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            mark_scale,
+            (40, 40, 255),
+            mark_th,
+            cv2.LINE_AA,
+        )
+        brow_len = max(8, body_r // 2)
+        cv2.line(
+            screen,
+            (eye_x - brow_len, eye_y - brow_len // 2),
+            (eye_x + brow_len // 2, eye_y - brow_len),
+            (20, 20, 20),
+            scaled(4, 1080, h),
+            cv2.LINE_AA,
+        )
+
+
+def add_catch_effect(effects, fish, args):
+    now = time.perf_counter()
+    effects.append({
+        "x": fish.x,
+        "y": fish.y,
+        "text": f"GET! +{fish.score}",
+        "color": (0, 255, 255),
+        "start": now,
+        "until": now + args.hit_effect_sec,
+    })
+
+
+def add_miss_effect(effects, fish, args):
+    now = time.perf_counter()
+    effects.append({
+        "x": fish.x,
+        "y": fish.y,
+        "text": f"MISS! {BAD_FISH_PENALTY}",
+        "color": (40, 40, 255),
+        "start": now,
+        "until": now + args.hit_effect_sec,
+    })
+    effects.append({
+        "x": fish.x,
+        "y": fish.y + scaled(58, 1080, args.screen_height),
+        "text": "POI BROKEN!",
+        "color": (40, 40, 255),
+        "start": now,
+        "until": now + args.hit_effect_sec,
+    })
+
+
+def draw_effects(screen, effects):
+    h, _ = screen.shape[:2]
+    now = time.perf_counter()
+    effects[:] = [effect for effect in effects if now < effect["until"]]
+    for effect in effects:
+        life = max(0.001, effect["until"] - effect["start"])
+        t = (now - effect["start"]) / life
+        y = int(effect["y"] - scaled(80, 1080, h) * t)
+        scale = (1.3 + 0.4 * (1.0 - t)) * h / 1080
+        cv2.putText(
+            screen,
+            effect["text"],
+            (int(effect["x"] - scaled(95, 1920, screen.shape[1])), y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            effect["color"],
+            scaled(4, 1080, h),
+            cv2.LINE_AA,
+        )
+        cv2.circle(screen, (int(effect["x"]), int(effect["y"])), int(scaled(70, 1080, h) * (1.0 + t)), effect["color"], scaled(3, 1080, h), cv2.LINE_AA)
+
+
+def draw_game_screen(w, h, fishes, selected_direction, score, remain_sec, args,
+                     blink=False, head_warning=False, effects=None, broken_pois=None):
     screen = np.zeros((h, w, 3), dtype=np.uint8)
-    draw_grid(screen)
+    draw_water_background(screen)
+    draw_all_pois(screen, selected_direction, args, blink=blink, broken_pois=broken_pois)
 
-    draw_gaze_area_frame(screen, gaze_area, blink=blink)
+    now = time.perf_counter()
+    for fish in fishes:
+        draw_fish(screen, fish, now)
 
-    for target in targets:
-        draw_enemy_mark(screen, target["area"], args, is_bonus=target["is_bonus"])
+    if effects is not None:
+        draw_effects(screen, effects)
 
-    put_text(screen, f"SCORE: {score}", scaled(55, 1080, h), scale=1.2 * h / 1080, thickness=scaled(3, 1080, h), x=scaled(35, 1920, w))
+    panel_h = scaled(86, 1080, h)
+    cv2.rectangle(screen, (0, 0), (w, panel_h), (45, 70, 55), -1)
+    cv2.line(screen, (0, panel_h), (w, panel_h), (0, 220, 220), scaled(3, 1080, h), cv2.LINE_AA)
+    put_text(screen, f"SCORE: {score}", scaled(55, 1080, h), color=(255, 255, 255), scale=1.15 * h / 1080, thickness=scaled(3, 1080, h), x=scaled(35, 1920, w))
+
+    direction_text = "SELECT: --" if selected_direction is None else f"SELECT: {DIRECTION_LABELS[selected_direction]}"
+    if selected_direction is not None and broken_pois and selected_direction in broken_pois:
+        direction_text += " (BROKEN)"
+    draw_centered_text(screen, direction_text, scaled(55, 1080, h), color=(0, 255, 255), scale=0.95 * h / 1080, thickness=scaled(3, 1080, h))
+
     time_text = f"TIME: {remain_sec:.1f}"
-    (tw, _), _ = cv2.getTextSize(time_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2 * h / 1080, scaled(3, 1080, h))
-    cv2.putText(screen, time_text, (w - tw - scaled(35, 1920, w), scaled(55, 1080, h)), cv2.FONT_HERSHEY_SIMPLEX, 1.2 * h / 1080, (255, 255, 255), scaled(3, 1080, h), cv2.LINE_AA)
-
-    draw_centered_text(screen, f"TARGET: {len(targets)}", scaled(55, 1080, h), color=(0, 255, 255), scale=0.9 * h / 1080, thickness=scaled(2, 1080, h))
-
-    if hit_visible and hit_area is not None:
-        cx, cy = get_area_center(w, h, hit_area)
-        draw_centered_text(screen, "HIT!", cy - scaled(120, 1080, h), color=(0, 255, 255), scale=1.8 * h / 1080, thickness=scaled(5, 1080, h))
+    (tw, _), _ = cv2.getTextSize(time_text, cv2.FONT_HERSHEY_SIMPLEX, 1.15 * h / 1080, scaled(3, 1080, h))
+    cv2.putText(screen, time_text, (w - tw - scaled(35, 1920, w), scaled(55, 1080, h)), cv2.FONT_HERSHEY_SIMPLEX, 1.15 * h / 1080, (255, 255, 255), scaled(3, 1080, h), cv2.LINE_AA)
 
     if blink:
-        draw_centered_text(screen, "SHOT", h - scaled(90, 1080, h), color=(0, 255, 255), scale=1.0 * h / 1080, thickness=scaled(3, 1080, h))
+        draw_centered_text(screen, "SCOOP!", h - scaled(95, 1080, h), color=(255, 0, 255), scale=1.15 * h / 1080, thickness=scaled(4, 1080, h))
     elif head_warning:
-        draw_centered_text(screen, "Please keep your head still", h - scaled(90, 1080, h), color=(0, 0, 255), scale=1.0 * h / 1080, thickness=scaled(3, 1080, h))
+        draw_centered_text(screen, "Please keep your head still", h - scaled(95, 1080, h), color=(0, 0, 255), scale=1.0 * h / 1080, thickness=scaled(3, 1080, h))
 
-    put_text(screen, "Look at the mark and blink to shoot / Press q to quit", h - scaled(35, 1080, h), scale=0.8 * h / 1080, thickness=scaled(2, 1080, h))
+    put_text(screen, "Look LEFT UP / RIGHT UP / LEFT DOWN / RIGHT DOWN, blink when a fish enters the poi.  Press q to quit", h - scaled(35, 1080, h), color=(255, 255, 255), scale=0.66 * h / 1080, thickness=scaled(2, 1080, h))
     return screen
 
 
@@ -638,9 +943,9 @@ def add_ranking_score(score, args):
 
 def draw_time_up_screen(w, h, score, rankings=None):
     screen = np.zeros((h, w, 3), dtype=np.uint8)
-    draw_grid(screen)
+    draw_water_background(screen)
     draw_centered_text(screen, "TIME UP!", scaled(210, 1080, h), color=(0, 255, 255), scale=2.1 * h / 1080, thickness=scaled(6, 1080, h))
-    draw_centered_text(screen, f"SCORE: {score}", scaled(325, 1080, h), scale=1.7 * h / 1080, thickness=scaled(5, 1080, h))
+    draw_centered_text(screen, f"FINAL SCORE: {score}", scaled(325, 1080, h), scale=1.7 * h / 1080, thickness=scaled(5, 1080, h))
 
     draw_centered_text(screen, "RANKING", scaled(455, 1080, h), color=(255, 255, 0), scale=1.25 * h / 1080, thickness=scaled(4, 1080, h))
 
@@ -770,9 +1075,12 @@ def main():
             post_blink_count = 0
             prev_blink = False
             score = 0
-            targets = [spawn_target([], args)]
-            hit_area = None
-            hit_effect_until = 0.0
+            fishes = [spawn_fish(args.screen_width, args.screen_height)]
+            effects = []
+            broken_pois = set()
+            last_spawn_time = time.perf_counter()
+            last_bad_spawn_time = time.perf_counter()
+            prev_frame_time = time.perf_counter()
             game_start_time = time.perf_counter()
             
             fps_start = time.perf_counter()
@@ -785,7 +1093,18 @@ def main():
                 if game_elapsed >= args.game_sec:
                     break
 
-                targets = update_targets(targets, args)
+                now_frame = time.perf_counter()
+                dt = min(0.05, max(0.001, now_frame - prev_frame_time))
+                prev_frame_time = now_frame
+                last_spawn_time, last_bad_spawn_time = update_fish(
+                    fishes,
+                    dt,
+                    args.screen_width,
+                    args.screen_height,
+                    args,
+                    last_spawn_time,
+                    last_bad_spawn_time,
+                )
 
                 frame, feature, info = process_frame(cap, face_mesh, args, realtime_smoother, args.realtime_beta)
 
@@ -807,28 +1126,33 @@ def main():
 
                     blink_trigger = blink_now and not prev_blink
 
-                    if blink_trigger and last_valid_area is not None:
-                        hit_target = None
-                        for target in targets:
-                            if target["area"] == last_valid_area:
-                                hit_target = target
+                    if blink_trigger and last_valid_area is not None and last_valid_area not in broken_pois:
+                        hit_fish = None
+                        for fish in fishes:
+                            if fish_in_poi(fish, args.screen_width, args.screen_height, last_valid_area, args):
+                                hit_fish = fish
                                 break
-                        if hit_target is not None:
-                            score += int(args.bonus_score if hit_target["is_bonus"] else args.normal_score)
-                            hit_area = hit_target["area"]
-                            hit_effect_until = time.perf_counter() + args.hit_effect_sec
-                            targets.remove(hit_target)
-                            if len(targets) < 2:
-                                targets.append(spawn_target([t["area"] for t in targets] + [hit_area], args))
+                        if hit_fish is not None:
+                            if hit_fish.is_bad:
+                                score += BAD_FISH_PENALTY
+                                broken_pois.add(last_valid_area)
+                                add_miss_effect(effects, hit_fish, args)
+                            else:
+                                score += hit_fish.score
+                                add_catch_effect(effects, hit_fish, args)
+                            fishes.remove(hit_fish)
+                            if len(fishes) < max(2, int(args.max_fish) // 2):
+                                fishes.append(spawn_fish(args.screen_width, args.screen_height))
+                                last_spawn_time = time.perf_counter()
 
                     if blink_now:
                         post_blink_count = args.post_blink_hold_frames
                     elif post_blink_count > 0:
                         post_blink_count -= 1
                     else:
-                        raw_area = classify_pure4(dx, dy, args.dead_x, args.dead_y)
-                        if raw_area is not None:
-                            pred_history.append(raw_area)
+                        raw_direction = classify_pure4(dx, dy, args.dead_x, args.dead_y)
+                        if raw_direction is not None:
+                            pred_history.append(raw_direction)
                             last_valid_area = Counter(pred_history).most_common(1)[0][0]
 
                     prev_blink = blink_now
@@ -838,15 +1162,15 @@ def main():
                 screen = draw_game_screen(
                     args.screen_width,
                     args.screen_height,
-                    targets,
+                    fishes,
                     last_valid_area,
                     score,
                     game_remain,
                     args,
                     blink=blink_now,
                     head_warning=head_warning,
-                    hit_area=hit_area,
-                    hit_visible=time.perf_counter() < hit_effect_until,
+                    effects=effects,
+                    broken_pois=broken_pois,
                 )
 
                 fps_frames += 1
