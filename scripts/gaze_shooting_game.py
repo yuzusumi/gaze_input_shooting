@@ -37,8 +37,14 @@ AREA_LABELS = {
 
 DIRECTION_LABELS = AREA_LABELS
 BAD_FISH_PENALTY = -10
-BAD_FISH_SPAWN_SEC = 5.0
+BAD_FISH_SPAWN_SEC = 8.0
 BAD_FISH_BOUNCE_JITTER_DEG = 38
+BACKGROUND_IMAGE = None
+BACKGROUND_CACHE = {}
+BACKGROUND_ANIMATION_CACHE = {}
+BACKGROUND_ANIMATION_FRAMES = 12
+BACKGROUND_ANIMATION_FPS = 4.0
+BACKGROUND_DARKEN_ALPHA = 0.82
 
 FISH_TYPES = [
     {
@@ -104,8 +110,8 @@ def parse_args():
     parser.add_argument("--hit-effect-sec", type=float, default=0.65)
     parser.add_argument("--target-life-sec", type=float, default=5.0)
     parser.add_argument("--target-overlap-sec", type=float, default=3.0)
-    parser.add_argument("--fish-spawn-sec", type=float, default=0.75)
-    parser.add_argument("--max-fish", type=int, default=11)
+    parser.add_argument("--fish-spawn-sec", type=float, default=0.45)
+    parser.add_argument("--max-fish", type=int, default=16)
     parser.add_argument("--poi-radius", type=int, default=118)
     parser.add_argument("--bonus-chance", type=float, default=0.20)
     parser.add_argument("--normal-score", type=int, default=1)
@@ -393,6 +399,7 @@ def draw_grid(screen):
 def draw_wait_screen(w, h, radius):
     screen = np.zeros((h, w, 3), dtype=np.uint8)
     draw_water_background(screen)
+    draw_water_grass(screen)
     cx, cy = w // 2, h // 2
     r = scaled(radius, 1080, h)
 
@@ -409,6 +416,7 @@ def draw_wait_screen(w, h, radius):
 def draw_calibration_screen(w, h, radius, remain_sec, elapsed, ignore_sec):
     screen = np.zeros((h, w, 3), dtype=np.uint8)
     draw_water_background(screen)
+    draw_water_grass(screen)
     cx, cy = w // 2, h // 2
     r = scaled(radius, 1080, h)
 
@@ -593,7 +601,12 @@ def update_fish(fishes, dt, w, h, args, last_spawn_time, last_bad_spawn_time):
         fishes.append(spawn_fish(w, h))
         last_spawn_time = now
 
-    if len(fishes) < max_fish and now - last_bad_spawn_time >= BAD_FISH_SPAWN_SEC:
+    if now - last_bad_spawn_time >= BAD_FISH_SPAWN_SEC:
+        if len(fishes) >= max_fish:
+            for i, fish in enumerate(fishes):
+                if not fish.is_bad:
+                    del fishes[i]
+                    break
         fishes.append(spawn_fish(w, h, bad_only=True))
         last_bad_spawn_time = now
 
@@ -618,7 +631,66 @@ def fish_in_poi(fish, w, h, direction, args):
     return math.hypot(fish.x - px, fish.y - py) <= catch_radius
 
 
+def load_background_image():
+    global BACKGROUND_IMAGE
+    if BACKGROUND_IMAGE is not None:
+        return BACKGROUND_IMAGE
+
+    img_dir = Path(__file__).resolve().parent.parent / "img"
+    image = cv2.imread(str(img_dir / "back_water.png"), cv2.IMREAD_COLOR)
+    BACKGROUND_IMAGE = image
+    return BACKGROUND_IMAGE
+
+
+def draw_background_image(screen):
+    background = load_background_image()
+    if background is None:
+        return False
+
+    h, w = screen.shape[:2]
+    cache_key = (w, h)
+    frames = BACKGROUND_ANIMATION_CACHE.get(cache_key)
+    if frames is None:
+        resized = BACKGROUND_CACHE.get(cache_key)
+        if resized is None:
+            resized = cv2.resize(background, (w, h), interpolation=cv2.INTER_AREA)
+            resized = cv2.convertScaleAbs(resized, alpha=BACKGROUND_DARKEN_ALPHA, beta=0)
+            BACKGROUND_CACHE[cache_key] = resized
+
+        base_x, base_y = np.meshgrid(
+            np.arange(w, dtype=np.float32),
+            np.arange(h, dtype=np.float32),
+        )
+        y_norm = base_y / max(1.0, float(h - 1))
+        x_norm = base_x / max(1.0, float(w - 1))
+        amp_x = max(0.5, w * 0.0022)
+        amp_y = max(0.25, h * 0.0010)
+        frames = []
+        for i in range(BACKGROUND_ANIMATION_FRAMES):
+            phase = i / float(BACKGROUND_ANIMATION_FRAMES) * math.tau
+            wave_x = np.sin(y_norm * math.tau * 2.0 + phase) * amp_x
+            wave_x += np.sin(y_norm * math.tau * 4.0 - phase * 1.2) * amp_x * 0.18
+            wave_y = np.sin(x_norm * math.tau * 1.4 - phase * 0.6) * amp_y
+            map_x = (base_x + wave_x).astype(np.float32)
+            map_y = (base_y + wave_y).astype(np.float32)
+            frames.append(cv2.remap(
+                resized,
+                map_x,
+                map_y,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT_101,
+            ))
+        BACKGROUND_ANIMATION_CACHE[cache_key] = frames
+
+    frame_index = int(time.perf_counter() * BACKGROUND_ANIMATION_FPS) % len(frames)
+    screen[:, :] = frames[frame_index]
+    return True
+
+
 def draw_water_background(screen):
+    if draw_background_image(screen):
+        return
+
     h, w = screen.shape[:2]
     top = np.array([105, 70, 28], dtype=np.float32)
     bottom = np.array([185, 135, 55], dtype=np.float32)
@@ -846,6 +918,8 @@ def draw_game_screen(w, h, fishes, selected_direction, score, remain_sec, args,
     for fish in fishes:
         draw_fish(screen, fish, now)
 
+    draw_water_grass(screen)
+
     if effects is not None:
         draw_effects(screen, effects)
 
@@ -944,6 +1018,7 @@ def add_ranking_score(score, args):
 def draw_time_up_screen(w, h, score, rankings=None):
     screen = np.zeros((h, w, 3), dtype=np.uint8)
     draw_water_background(screen)
+    draw_water_grass(screen)
     draw_centered_text(screen, "TIME UP!", scaled(210, 1080, h), color=(0, 255, 255), scale=2.1 * h / 1080, thickness=scaled(6, 1080, h))
     draw_centered_text(screen, f"FINAL SCORE: {score}", scaled(325, 1080, h), scale=1.7 * h / 1080, thickness=scaled(5, 1080, h))
 
@@ -1075,7 +1150,11 @@ def main():
             post_blink_count = 0
             prev_blink = False
             score = 0
-            fishes = [spawn_fish(args.screen_width, args.screen_height)]
+            initial_fish_count = min(max(4, int(args.max_fish) // 3), int(args.max_fish))
+            fishes = [
+                spawn_fish(args.screen_width, args.screen_height)
+                for _ in range(initial_fish_count)
+            ]
             effects = []
             broken_pois = set()
             last_spawn_time = time.perf_counter()
@@ -1127,21 +1206,27 @@ def main():
                     blink_trigger = blink_now and not prev_blink
 
                     if blink_trigger and last_valid_area is not None and last_valid_area not in broken_pois:
-                        hit_fish = None
-                        for fish in fishes:
-                            if fish_in_poi(fish, args.screen_width, args.screen_height, last_valid_area, args):
-                                hit_fish = fish
-                                break
-                        if hit_fish is not None:
-                            if hit_fish.is_bad:
-                                score += BAD_FISH_PENALTY
+                        hit_fishes = [
+                            fish
+                            for fish in fishes
+                            if fish_in_poi(fish, args.screen_width, args.screen_height, last_valid_area, args)
+                        ]
+                        if hit_fishes:
+                            caught_bad = False
+                            for hit_fish in hit_fishes:
+                                if hit_fish.is_bad:
+                                    score += BAD_FISH_PENALTY
+                                    caught_bad = True
+                                    add_miss_effect(effects, hit_fish, args)
+                                else:
+                                    score += hit_fish.score
+                                    add_catch_effect(effects, hit_fish, args)
+                            if caught_bad:
                                 broken_pois.add(last_valid_area)
-                                add_miss_effect(effects, hit_fish, args)
-                            else:
-                                score += hit_fish.score
-                                add_catch_effect(effects, hit_fish, args)
-                            fishes.remove(hit_fish)
-                            if len(fishes) < max(2, int(args.max_fish) // 2):
+
+                            hit_fish_ids = {id(fish) for fish in hit_fishes}
+                            fishes[:] = [fish for fish in fishes if id(fish) not in hit_fish_ids]
+                            while len(fishes) < max(2, int(args.max_fish) // 2):
                                 fishes.append(spawn_fish(args.screen_width, args.screen_height))
                                 last_spawn_time = time.perf_counter()
 
@@ -1204,6 +1289,458 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+
+
+_draw_fish_shape_fallback = draw_fish
+FISH_SPRITES = None
+FISH_RESIZED_SPRITE_CACHE = {}
+FISH_WARP_GRID_CACHE = {}
+FISH_RENDER_CACHE = {}
+FISH_ANIMATION_FPS = 10.0
+FISH_ANGLE_BUCKET_DEG = 8.0
+FISH_SHADOW_ALPHA_SCALE = 0.58
+GOLD_FISH_SHADOW_SCALE = 0.84
+WATER_GRASS_SPRITES = None
+WATER_GRASS_RESIZED_CACHE = {}
+WATER_GRASS_DARKEN_ALPHA = 0.86
+WATER_GRASS_SWAY_FPS = 1.2
+WATER_GRASS_SWAY_X_RATIO = 0.0015
+WATER_GRASS_SWAY_Y_RATIO = 0.0006
+
+
+def load_fish_sprites():
+    global FISH_SPRITES
+    if FISH_SPRITES is not None:
+        return FISH_SPRITES
+
+    import os
+
+    img_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "img"))
+    sprite_files = {
+        "normal": "orange_fish.png",
+        "goldfish": "orange_fish.png",
+        "red": "red_fish.png",
+        "rare": "gold_fish.png",
+        "bad": "black_fish.png",
+        "bad_mark": "black_fish_mark.png",
+        "normal_shadow": "orange_fish_shadow.png",
+        "red_shadow": "red_fish_shadow.png",
+        "rare_shadow": "gold_fish_shadow.png",
+        "bad_shadow": "black_fish_shadow.png",
+    }
+    sprites = {}
+    for key, filename in sprite_files.items():
+        path = os.path.join(img_dir, filename)
+        sprite = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if sprite is None:
+            continue
+        if sprite.ndim == 2:
+            sprite = cv2.cvtColor(sprite, cv2.COLOR_GRAY2BGRA)
+        elif sprite.shape[2] == 3:
+            alpha = np.full(sprite.shape[:2] + (1,), 255, dtype=np.uint8)
+            sprite = np.concatenate([sprite, alpha], axis=2)
+        if key.endswith("_shadow"):
+            sprite = sprite.copy()
+            sprite[:, :, 3] = np.clip(sprite[:, :, 3].astype(np.float32) * FISH_SHADOW_ALPHA_SCALE, 0, 255).astype(np.uint8)
+        sprites[key] = sprite
+
+    if "bad" in sprites and "bad_mark" in sprites:
+        bad = sprites["bad"].copy()
+        mark = sprites["bad_mark"]
+        bad_h, bad_w = bad.shape[:2]
+        mark_h, mark_w = mark.shape[:2]
+        target_mark_h = max(10, int(bad_h * 0.34))
+        target_mark_w = max(10, int(target_mark_h * mark_w / max(1, mark_h)))
+        mark = cv2.resize(mark, (target_mark_w, target_mark_h), interpolation=cv2.INTER_AREA)
+
+        y1 = max(0, int(bad_h * 0.04))
+        x1 = min(max(0, bad_w - target_mark_w - int(bad_w * 0.04)), bad_w - 1)
+        x2 = min(bad_w, x1 + target_mark_w)
+        y2 = min(bad_h, y1 + target_mark_h)
+        mark = mark[: y2 - y1, : x2 - x1]
+
+        alpha = mark[:, :, 3:4].astype(np.uint16)
+        bad_roi = bad[y1:y2, x1:x2].astype(np.uint16)
+        mark_rgb = mark[:, :, :3].astype(np.uint16)
+        bad[y1:y2, x1:x2, :3] = ((mark_rgb * alpha + bad_roi[:, :, :3] * (255 - alpha) + 127) // 255).astype(np.uint8)
+        bad[y1:y2, x1:x2, 3:4] = np.maximum(bad_roi[:, :, 3:4], alpha).astype(np.uint8)
+        sprites["bad"] = bad
+
+    FISH_SPRITES = sprites
+    return FISH_SPRITES
+
+
+def _fish_value(fish, name, default=None):
+    if isinstance(fish, dict):
+        return fish.get(name, default)
+    return getattr(fish, name, default)
+
+
+def _fish_type_text(fish):
+    candidates = [
+        _fish_value(fish, "fish_type"),
+        _fish_value(fish, "type_info"),
+        _fish_value(fish, "type_name"),
+        _fish_value(fish, "type"),
+        _fish_value(fish, "kind"),
+        _fish_value(fish, "name"),
+        _fish_value(fish, "label"),
+        _fish_value(fish, "color"),
+    ]
+    if _fish_value(fish, "is_bad", False):
+        return "bad"
+    if _fish_value(fish, "is_rare", False):
+        return "rare"
+    for value in candidates:
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("type") or value.get("kind") or value.get("color")
+        if value:
+            return str(value).lower()
+    return "normal"
+
+
+def _fish_sprite_key(fish):
+    text = _fish_type_text(fish)
+    if "bad" in text or "black" in text:
+        return "bad"
+    if "rare" in text or "special" in text:
+        return "rare"
+    if "red" in text:
+        return "red"
+    return "normal"
+
+
+def _fish_shadow_key(sprite_key):
+    return f"{sprite_key}_shadow"
+
+
+def warp_fish_sprite(sprite, fish, now, cache_sprite_key=None, size_multiplier=1.0):
+    radius = max(8, int(_fish_value(fish, "radius", 24)))
+    src_h, src_w = sprite.shape[:2]
+    sprite_key = cache_sprite_key or _fish_sprite_key(fish)
+    size_scale = 4.6 if str(sprite_key).startswith("bad") else 3.8
+    target_h = max(14, int(radius * size_scale * size_multiplier))
+    target_w = max(8, int(target_h * src_w / max(1, src_h)))
+
+    resized_key = (sprite_key, target_w, target_h)
+    resized = FISH_RESIZED_SPRITE_CACHE.get(resized_key)
+    if resized is None:
+        resized = cv2.resize(sprite, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        FISH_RESIZED_SPRITE_CACHE[resized_key] = resized
+
+    h, w = resized.shape[:2]
+    grid = FISH_WARP_GRID_CACHE.get((w, h))
+    if grid is None:
+        base_x, base_y = np.meshgrid(
+            np.arange(w, dtype=np.float32),
+            np.arange(h, dtype=np.float32),
+        )
+        y_norm = base_y / max(1.0, float(h - 1))
+        tail_weight = np.clip((y_norm - 0.28) / 0.72, 0.0, 1.0)
+        tail_weight = np.power(tail_weight, 1.35).astype(np.float32)
+        grid = (base_x, base_y, y_norm, tail_weight)
+        FISH_WARP_GRID_CACHE[(w, h)] = grid
+    base_x, base_y, y_norm, tail_weight = grid
+    phase = float(now) * 5.5 + float(_fish_value(fish, "wiggle_phase", _fish_value(fish, "phase", 0.0)))
+    amplitude = max(1.5, radius * 0.16)
+
+    wave = np.sin(phase + y_norm * np.pi * 2.2) * amplitude * tail_weight
+    map_x = base_x - wave.astype(np.float32)
+
+    return cv2.remap(
+        resized,
+        map_x,
+        base_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+
+def _rotate_rgba(image, angle_deg):
+    h, w = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    cos_a = abs(matrix[0, 0])
+    sin_a = abs(matrix[0, 1])
+    new_w = int(h * sin_a + w * cos_a)
+    new_h = int(h * cos_a + w * sin_a)
+    matrix[0, 2] += new_w / 2.0 - center[0]
+    matrix[1, 2] += new_h / 2.0 - center[1]
+    return cv2.warpAffine(
+        image,
+        matrix,
+        (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+
+def add_gold_sparkles(rgba, phase_bucket):
+    if rgba is None or rgba.size == 0 or rgba.shape[2] < 4:
+        return rgba
+
+    image = rgba.copy()
+    h, w = image.shape[:2]
+    sparkle_points = (
+        (0.34, 0.28, 0),
+        (0.66, 0.38, 2),
+        (0.48, 0.58, 4),
+    )
+    for x_ratio, y_ratio, offset in sparkle_points:
+        pulse = (phase_bucket + offset) % 6
+        if pulse >= 4:
+            continue
+
+        alpha = int(135 + pulse * 35)
+        radius = max(2, int(min(w, h) * (0.025 + pulse * 0.004)))
+        cx = int(w * x_ratio)
+        cy = int(h * y_ratio)
+        color = (255, 255, 235, alpha)
+        cv2.circle(image, (cx, cy), radius, color, -1, cv2.LINE_AA)
+        arm = radius * 3
+        cv2.line(image, (cx - arm, cy), (cx + arm, cy), color, max(1, radius // 2), cv2.LINE_AA)
+        cv2.line(image, (cx, cy - arm), (cx, cy + arm), color, max(1, radius // 2), cv2.LINE_AA)
+
+    return image
+
+
+def alpha_blend(frame, rgba, center_x, center_y):
+    if rgba is None or rgba.size == 0 or rgba.shape[2] < 4:
+        return False
+
+    h, w = rgba.shape[:2]
+    x1 = int(round(center_x - w / 2))
+    y1 = int(round(center_y - h / 2))
+    x2 = x1 + w
+    y2 = y1 + h
+
+    frame_h, frame_w = frame.shape[:2]
+    roi_x1 = max(0, x1)
+    roi_y1 = max(0, y1)
+    roi_x2 = min(frame_w, x2)
+    roi_y2 = min(frame_h, y2)
+    if roi_x1 >= roi_x2 or roi_y1 >= roi_y2:
+        return False
+
+    sprite_x1 = roi_x1 - x1
+    sprite_y1 = roi_y1 - y1
+    sprite_x2 = sprite_x1 + (roi_x2 - roi_x1)
+    sprite_y2 = sprite_y1 + (roi_y2 - roi_y1)
+
+    sprite_roi = rgba[sprite_y1:sprite_y2, sprite_x1:sprite_x2]
+    alpha = sprite_roi[:, :, 3:4].astype(np.uint16)
+    if np.max(alpha) <= 0:
+        return False
+
+    frame_roi = frame[roi_y1:roi_y2, roi_x1:roi_x2].astype(np.uint16)
+    sprite_rgb = sprite_roi[:, :, :3].astype(np.uint16)
+    blended = (sprite_rgb * alpha + frame_roi * (255 - alpha) + 127) // 255
+    frame[roi_y1:roi_y2, roi_x1:roi_x2] = blended.astype(np.uint8)
+    return True
+
+
+def load_water_grass_sprites():
+    global WATER_GRASS_SPRITES
+    if WATER_GRASS_SPRITES is not None:
+        return WATER_GRASS_SPRITES
+
+    img_dir = Path(__file__).resolve().parent.parent / "img"
+    sprites = {}
+    for key, filename in (("grass1", "water_grass_1.png"), ("grass2", "water_grass_2.png")):
+        sprite = cv2.imread(str(img_dir / filename), cv2.IMREAD_UNCHANGED)
+        if sprite is None:
+            continue
+        if sprite.ndim == 2:
+            sprite = cv2.cvtColor(sprite, cv2.COLOR_GRAY2BGRA)
+        elif sprite.shape[2] == 3:
+            alpha = np.full(sprite.shape[:2] + (1,), 255, dtype=np.uint8)
+            sprite = np.concatenate([sprite, alpha], axis=2)
+        sprites[key] = sprite
+
+    WATER_GRASS_SPRITES = sprites
+    return WATER_GRASS_SPRITES
+
+
+def draw_water_grass(screen):
+    sprites = load_water_grass_sprites()
+    if not sprites:
+        return
+
+    h, w = screen.shape[:2]
+    placements = (
+        ("grass1", 0.62, 0.62, 0.28),
+        ("grass2", 0.09, 0.17, 0.29),
+    )
+    now = time.perf_counter()
+    for index, (key, x_ratio, y_ratio, height_ratio) in enumerate(placements):
+        sprite = sprites.get(key)
+        if sprite is None:
+            continue
+
+        target_h = max(24, int(h * height_ratio))
+        src_h, src_w = sprite.shape[:2]
+        target_w = max(16, int(target_h * src_w / max(1, src_h)))
+        cache_key = (key, target_w, target_h)
+        resized = WATER_GRASS_RESIZED_CACHE.get(cache_key)
+        if resized is None:
+            resized = cv2.resize(sprite, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            resized[:, :, :3] = cv2.convertScaleAbs(resized[:, :, :3], alpha=WATER_GRASS_DARKEN_ALPHA, beta=0)
+            WATER_GRASS_RESIZED_CACHE[cache_key] = resized
+
+        phase = now * WATER_GRASS_SWAY_FPS + index * 1.7
+        sway_x = math.sin(phase) * w * WATER_GRASS_SWAY_X_RATIO
+        sway_y = math.sin(phase * 0.7 + 0.8) * h * WATER_GRASS_SWAY_Y_RATIO
+        alpha_blend(screen, resized, w * x_ratio + sway_x, h * y_ratio + sway_y)
+
+
+def draw_fish_shadow(frame, center_x, center_y, sprite_w, sprite_h, radius):
+    h, w = frame.shape[:2]
+    shadow_w = max(10, int(sprite_w * 0.42))
+    shadow_h = max(4, int(sprite_h * 0.13))
+    shadow_x = int(round(center_x))
+    shadow_y = int(round(center_y + radius * 0.58))
+
+    x1 = max(0, shadow_x - shadow_w)
+    y1 = max(0, shadow_y - shadow_h)
+    x2 = min(w, shadow_x + shadow_w + 1)
+    y2 = min(h, shadow_y + shadow_h + 1)
+    if x1 >= x2 or y1 >= y2:
+        return
+
+    mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+    cv2.ellipse(
+        mask,
+        (shadow_x - x1, shadow_y - y1),
+        (shadow_w, shadow_h),
+        0,
+        0,
+        360,
+        70,
+        -1,
+        cv2.LINE_AA,
+    )
+    alpha = mask[:, :, None].astype(np.uint16)
+    roi = frame[y1:y2, x1:x2].astype(np.uint16)
+    shadow_color = np.array([18, 26, 30], dtype=np.uint16)
+    frame[y1:y2, x1:x2] = ((shadow_color * alpha + roi * (255 - alpha) + 127) // 255).astype(np.uint8)
+
+
+def draw_fish_sprite(frame, fish, now):
+    sprites = load_fish_sprites()
+    key = _fish_sprite_key(fish)
+    sprite = sprites.get(key)
+    if sprite is None and key == "bad":
+        sprite = sprites.get("bad_mark")
+    if sprite is None:
+        return False
+
+    x = _fish_value(fish, "x")
+    y = _fish_value(fish, "y")
+    if x is None or y is None:
+        pos = _fish_value(fish, "pos") or _fish_value(fish, "position")
+        if pos is not None and len(pos) >= 2:
+            x, y = pos[0], pos[1]
+    if x is None or y is None:
+        return False
+
+    vx = float(_fish_value(fish, "vx", 0.0))
+    vy = float(_fish_value(fish, "vy", 0.0))
+    if abs(vx) + abs(vy) < 0.001:
+        angle = float(_fish_value(fish, "angle", 0.0))
+    else:
+        angle = -(math.degrees(math.atan2(vy, vx)) + 90.0)
+
+    radius = max(8, int(_fish_value(fish, "radius", 24)))
+    angle_bucket = int(round(angle / FISH_ANGLE_BUCKET_DEG))
+    frame_bucket = int(float(now) * FISH_ANIMATION_FPS)
+    cache_key = (id(fish), key, radius, angle_bucket, frame_bucket)
+    rotated = FISH_RENDER_CACHE.get(cache_key)
+    if rotated is None:
+        warped = warp_fish_sprite(sprite, fish, frame_bucket / FISH_ANIMATION_FPS)
+        rotated = _rotate_rgba(warped, angle_bucket * FISH_ANGLE_BUCKET_DEG)
+        if key == "rare":
+            rotated = add_gold_sparkles(rotated, frame_bucket)
+        if len(FISH_RENDER_CACHE) > 160:
+            FISH_RENDER_CACHE.clear()
+        FISH_RENDER_CACHE[cache_key] = rotated
+
+    shadow_key = _fish_shadow_key(key)
+    shadow_sprite = sprites.get(shadow_key)
+    if shadow_sprite is not None:
+        shadow_size_multiplier = GOLD_FISH_SHADOW_SCALE if key == "rare" else 1.0
+        shadow_cache_key = (id(fish), shadow_key, radius, angle_bucket, frame_bucket, shadow_size_multiplier)
+        shadow_rotated = FISH_RENDER_CACHE.get(shadow_cache_key)
+        if shadow_rotated is None:
+            shadow_warped = warp_fish_sprite(
+                shadow_sprite,
+                fish,
+                frame_bucket / FISH_ANIMATION_FPS,
+                shadow_key,
+                shadow_size_multiplier,
+            )
+            shadow_rotated = _rotate_rgba(shadow_warped, angle_bucket * FISH_ANGLE_BUCKET_DEG)
+            if len(FISH_RENDER_CACHE) > 160:
+                FISH_RENDER_CACHE.clear()
+            FISH_RENDER_CACHE[shadow_cache_key] = shadow_rotated
+        shadow_offset = max(3, int(radius * 0.34))
+        alpha_blend(frame, shadow_rotated, float(x) + shadow_offset, float(y) + shadow_offset)
+    return alpha_blend(frame, rotated, float(x), float(y))
+
+
+def draw_fish(frame, fish, *args, **kwargs):
+    now = kwargs.get("now", kwargs.get("t", None))
+    if now is None:
+        for value in args:
+            if isinstance(value, (int, float)):
+                now = value
+                break
+    if now is None:
+        now = time.time()
+
+    try:
+        if draw_fish_sprite(frame, fish, now):
+            return None
+    except Exception:
+        pass
+    return _draw_fish_shape_fallback(frame, fish, *args, **kwargs)
+
+
+def rebalance_fish_spawn_rates():
+    if "FISH_TYPES" not in globals():
+        return
+
+    spawn_rates = {
+        "normal": 0.54,
+        "red": 0.30,
+        "rare": 0.16,
+    }
+    rate_keys = ("weight", "spawn_weight", "probability", "prob", "chance")
+
+    for fish_type in FISH_TYPES:
+        if not isinstance(fish_type, dict):
+            continue
+        name = str(fish_type.get("name", "")).strip().lower()
+        if "bad" in name or "black" in name:
+            continue
+        if "rare" in name or "special" in name:
+            rate = spawn_rates["rare"]
+        elif "red" in name:
+            rate = spawn_rates["red"]
+        else:
+            rate = spawn_rates["normal"]
+
+        has_rate_key = False
+        for key in rate_keys:
+            if key in fish_type:
+                fish_type[key] = rate
+                has_rate_key = True
+        if not has_rate_key:
+            fish_type["weight"] = rate
+
+
+rebalance_fish_spawn_rates()
 
 
 if __name__ == "__main__":
