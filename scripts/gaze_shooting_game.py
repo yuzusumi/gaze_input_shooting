@@ -42,7 +42,7 @@ BAD_FISH_BOUNCE_JITTER_DEG = 38
 BACKGROUND_IMAGE = None
 BACKGROUND_CACHE = {}
 BACKGROUND_ANIMATION_CACHE = {}
-BACKGROUND_ANIMATION_FRAMES = 12
+BACKGROUND_ANIMATION_FRAMES = 8
 BACKGROUND_ANIMATION_FPS = 4.0
 BACKGROUND_DARKEN_ALPHA = 0.82
 
@@ -107,6 +107,8 @@ def parse_args():
     parser.add_argument("--calib-sec", type=float, default=5.0)
     parser.add_argument("--ignore-sec", type=float, default=1.0)
     parser.add_argument("--game-sec", type=float, default=30.0)
+    parser.add_argument("--skip-calibration", action="store_true")
+    parser.add_argument("--no-time-limit", action="store_true")
     parser.add_argument("--hit-effect-sec", type=float, default=0.65)
     parser.add_argument("--target-life-sec", type=float, default=5.0)
     parser.add_argument("--target-overlap-sec", type=float, default=3.0)
@@ -400,7 +402,7 @@ def draw_wait_screen(w, h, radius):
     screen = np.zeros((h, w, 3), dtype=np.uint8)
     draw_water_background(screen)
     draw_water_grass(screen)
-    cx, cy = w // 2, h // 2
+    cx, cy = w // 2, h // 2 - scaled(40, 1080, h)
     r = scaled(radius, 1080, h)
 
     cv2.circle(screen, (cx, cy), r + scaled(14, 1080, h), (0, 255, 255), scaled(4, 1080, h), cv2.LINE_AA)
@@ -417,7 +419,7 @@ def draw_calibration_screen(w, h, radius, remain_sec, elapsed, ignore_sec):
     screen = np.zeros((h, w, 3), dtype=np.uint8)
     draw_water_background(screen)
     draw_water_grass(screen)
-    cx, cy = w // 2, h // 2
+    cx, cy = w // 2, h // 2 - scaled(40, 1080, h)
     r = scaled(radius, 1080, h)
 
     cv2.circle(screen, (cx, cy), r + scaled(14, 1080, h), (0, 255, 255), scaled(4, 1080, h), cv2.LINE_AA)
@@ -589,6 +591,27 @@ def spawn_fish(w, h, bad_only=False):
     )
 
 
+def is_rare_fish(fish):
+    name = str(fish.name if isinstance(fish, Fish) else fish.get("name", "")).lower()
+    return "rare" in name or "special" in name
+
+
+def spawn_initial_fishes(w, h, count):
+    fishes = []
+    max_initial_rare = max(1, count // 5)
+    rare_count = 0
+    attempts = 0
+    while len(fishes) < count:
+        fish = spawn_fish(w, h)
+        attempts += 1
+        if is_rare_fish(fish):
+            if rare_count >= max_initial_rare and attempts < count * 8:
+                continue
+            rare_count += 1
+        fishes.append(fish)
+    return fishes
+
+
 def update_fish(fishes, dt, w, h, args, last_spawn_time, last_bad_spawn_time):
     max_fish = max(1, int(args.max_fish))
     spawn_sec = max(0.25, float(args.fish_spawn_sec))
@@ -602,11 +625,6 @@ def update_fish(fishes, dt, w, h, args, last_spawn_time, last_bad_spawn_time):
         last_spawn_time = now
 
     if now - last_bad_spawn_time >= BAD_FISH_SPAWN_SEC:
-        if len(fishes) >= max_fish:
-            for i, fish in enumerate(fishes):
-                if not fish.is_bad:
-                    del fishes[i]
-                    break
         fishes.append(spawn_fish(w, h, bad_only=True))
         last_bad_spawn_time = now
 
@@ -1108,6 +1126,7 @@ def main():
     ) as face_mesh:
         while True:
             baseline_info = None
+            baseline_feature = None
             calib_smoother.reset()
 
             while True:
@@ -1121,24 +1140,33 @@ def main():
 
                 if info is not None and feature is not None:
                     baseline_info = info
+                    baseline_feature = feature
 
                 key = cv2.waitKey(1) & 0xFF
-                if key in (13, 10) and baseline_info is not None:
+                if key in (13, 10) and baseline_info is not None and baseline_feature is not None:
                     break
                 if key == ord("q"):
                     cap.release()
                     cv2.destroyAllWindows()
                     return
 
-            center_feature, center_info, quit_requested = run_center_calibration(
-                cap, face_mesh, args, calib_smoother
-            )
-            if quit_requested:
-                break
+            if args.skip_calibration:
+                center_feature, center_info, quit_requested = baseline_feature, baseline_info, False
+            else:
+                center_feature, center_info, quit_requested = run_center_calibration(
+                    cap, face_mesh, args, calib_smoother
+                )
+                if quit_requested:
+                    break
             if center_feature is None:
                 continue
             if center_info is None:
                 center_info = baseline_info
+
+            try:
+                cv2.destroyWindow("camera_landmarks")
+            except cv2.error:
+                pass
 
             base_eye_x = center_info["eye_center_x"]
             base_eye_y = center_info["eye_center_y"]
@@ -1151,10 +1179,7 @@ def main():
             prev_blink = False
             score = 0
             initial_fish_count = min(max(4, int(args.max_fish) // 3), int(args.max_fish))
-            fishes = [
-                spawn_fish(args.screen_width, args.screen_height)
-                for _ in range(initial_fish_count)
-            ]
+            fishes = spawn_initial_fishes(args.screen_width, args.screen_height, initial_fish_count)
             effects = []
             broken_pois = set()
             last_spawn_time = time.perf_counter()
@@ -1168,8 +1193,8 @@ def main():
 
             while True:
                 game_elapsed = time.perf_counter() - game_start_time
-                game_remain = max(0.0, args.game_sec - game_elapsed)
-                if game_elapsed >= args.game_sec:
+                game_remain = game_elapsed if args.no_time_limit else max(0.0, args.game_sec - game_elapsed)
+                if (not args.no_time_limit) and game_elapsed >= args.game_sec:
                     break
 
                 now_frame = time.perf_counter()
@@ -1187,9 +1212,6 @@ def main():
 
                 frame, feature, info = process_frame(cap, face_mesh, args, realtime_smoother, args.realtime_beta)
 
-                landmark_view = draw_landmark_view(frame, info)
-                if landmark_view is not None:
-                    cv2.imshow("camera_landmarks", landmark_view)
                 dx, dy = calc_offset_xy(feature, center_feature, args)
                 head_warning = False
                 blink_now = False
@@ -1296,10 +1318,21 @@ FISH_SPRITES = None
 FISH_RESIZED_SPRITE_CACHE = {}
 FISH_WARP_GRID_CACHE = {}
 FISH_RENDER_CACHE = {}
-FISH_ANIMATION_FPS = 10.0
+FISH_RENDER_CACHE_MAX = 160
+FISH_ANIMATION_FPS = 8.0
 FISH_ANGLE_BUCKET_DEG = 8.0
+FISH_WIGGLE_SPEED = 2.35
+FISH_WIGGLE_SPEED_BY_MOVE = 0.18
+FISH_WIGGLE_SPEED_MAX_BONUS = 1.8
+FISH_WIGGLE_BODY_WAVE = 1.05
+FISH_COLOR_SATURATION_SCALE = 1.12
+FISH_COLOR_VALUE_SCALE = 0.96
+FISH_SHADOW_ENABLED = True
+FISH_SHADOW_ANIMATION_DIVISOR = 2
 FISH_SHADOW_ALPHA_SCALE = 0.58
 GOLD_FISH_SHADOW_SCALE = 0.84
+GOLD_FISH_OUTLINE_ALPHA = 135
+GOLD_FISH_OUTLINE_SIZE = 5
 WATER_GRASS_SPRITES = None
 WATER_GRASS_RESIZED_CACHE = {}
 WATER_GRASS_DARKEN_ALPHA = 0.86
@@ -1320,7 +1353,7 @@ def load_fish_sprites():
         "normal": "orange_fish.png",
         "goldfish": "orange_fish.png",
         "red": "red_fish.png",
-        "rare": "gold_fish.png",
+        "rare": "gold_fish_outlined.png",
         "bad": "black_fish.png",
         "bad_mark": "black_fish_mark.png",
         "normal_shadow": "orange_fish_shadow.png",
@@ -1332,6 +1365,8 @@ def load_fish_sprites():
     for key, filename in sprite_files.items():
         path = os.path.join(img_dir, filename)
         sprite = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if sprite is None and key == "rare":
+            sprite = cv2.imread(os.path.join(img_dir, "gold_fish.png"), cv2.IMREAD_UNCHANGED)
         if sprite is None:
             continue
         if sprite.ndim == 2:
@@ -1342,6 +1377,12 @@ def load_fish_sprites():
         if key.endswith("_shadow"):
             sprite = sprite.copy()
             sprite[:, :, 3] = np.clip(sprite[:, :, 3].astype(np.float32) * FISH_SHADOW_ALPHA_SCALE, 0, 255).astype(np.uint8)
+        elif key not in ("bad_mark",):
+            sprite = sprite.copy()
+            hsv = cv2.cvtColor(sprite[:, :, :3], cv2.COLOR_BGR2HSV).astype(np.float32)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * FISH_COLOR_SATURATION_SCALE, 0, 255)
+            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * FISH_COLOR_VALUE_SCALE, 0, 255)
+            sprite[:, :, :3] = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
         sprites[key] = sprite
 
     if "bad" in sprites and "bad_mark" in sprites:
@@ -1414,6 +1455,11 @@ def _fish_shadow_key(sprite_key):
     return f"{sprite_key}_shadow"
 
 
+def prune_fish_render_cache(current_frame_bucket):
+    if len(FISH_RENDER_CACHE) > FISH_RENDER_CACHE_MAX:
+        FISH_RENDER_CACHE.clear()
+
+
 def warp_fish_sprite(sprite, fish, now, cache_sprite_key=None, size_multiplier=1.0):
     radius = max(8, int(_fish_value(fish, "radius", 24)))
     src_h, src_w = sprite.shape[:2]
@@ -1436,15 +1482,23 @@ def warp_fish_sprite(sprite, fish, now, cache_sprite_key=None, size_multiplier=1
             np.arange(h, dtype=np.float32),
         )
         y_norm = base_y / max(1.0, float(h - 1))
-        tail_weight = np.clip((y_norm - 0.28) / 0.72, 0.0, 1.0)
-        tail_weight = np.power(tail_weight, 1.35).astype(np.float32)
+        body_weight = np.clip((y_norm - 0.24) / 0.42, 0.0, 1.0)
+        body_weight = body_weight * body_weight * (3.0 - 2.0 * body_weight)
+        tail_weight = np.clip((y_norm - 0.62) / 0.38, 0.0, 1.0)
+        tail_weight = tail_weight * tail_weight * (3.0 - 2.0 * tail_weight)
+        tail_weight = (body_weight * 0.32 + tail_weight * 0.68).astype(np.float32)
         grid = (base_x, base_y, y_norm, tail_weight)
         FISH_WARP_GRID_CACHE[(w, h)] = grid
     base_x, base_y, y_norm, tail_weight = grid
-    phase = float(now) * 5.5 + float(_fish_value(fish, "wiggle_phase", _fish_value(fish, "phase", 0.0)))
-    amplitude = max(1.5, radius * 0.16)
+    move_speed = math.hypot(
+        float(_fish_value(fish, "vx", 0.0)),
+        float(_fish_value(fish, "vy", 0.0)),
+    )
+    speed_bonus = min(FISH_WIGGLE_SPEED_MAX_BONUS, (move_speed / max(1.0, float(radius))) * FISH_WIGGLE_SPEED_BY_MOVE)
+    phase = float(now) * (FISH_WIGGLE_SPEED + speed_bonus) + float(_fish_value(fish, "wiggle_phase", _fish_value(fish, "phase", 0.0)))
+    amplitude = max(1.5, radius * 0.18)
 
-    wave = np.sin(phase + y_norm * np.pi * 2.2) * amplitude * tail_weight
+    wave = np.sin(phase - y_norm * math.tau * FISH_WIGGLE_BODY_WAVE) * amplitude * tail_weight
     map_x = base_x - wave.astype(np.float32)
 
     return cv2.remap(
@@ -1484,26 +1538,46 @@ def add_gold_sparkles(rgba, phase_bucket):
     image = rgba.copy()
     h, w = image.shape[:2]
     sparkle_points = (
-        (0.34, 0.28, 0),
-        (0.66, 0.38, 2),
-        (0.48, 0.58, 4),
+        (0.32, 0.25, 0),
+        (0.66, 0.34, 2),
+        (0.48, 0.56, 4),
     )
     for x_ratio, y_ratio, offset in sparkle_points:
-        pulse = (phase_bucket + offset) % 6
-        if pulse >= 4:
+        pulse = (phase_bucket + offset) % 8
+        if pulse >= 5:
             continue
 
-        alpha = int(135 + pulse * 35)
-        radius = max(2, int(min(w, h) * (0.025 + pulse * 0.004)))
+        alpha = int(165 + pulse * 16)
+        radius = max(2, int(min(w, h) * (0.026 + pulse * 0.003)))
         cx = int(w * x_ratio)
         cy = int(h * y_ratio)
-        color = (255, 255, 235, alpha)
+        color = (255, 248, 220, alpha)
         cv2.circle(image, (cx, cy), radius, color, -1, cv2.LINE_AA)
         arm = radius * 3
         cv2.line(image, (cx - arm, cy), (cx + arm, cy), color, max(1, radius // 2), cv2.LINE_AA)
         cv2.line(image, (cx, cy - arm), (cx, cy + arm), color, max(1, radius // 2), cv2.LINE_AA)
 
     return image
+
+
+def make_gold_outline(rgba):
+    if rgba is None or rgba.size == 0 or rgba.shape[2] < 4:
+        return None
+
+    alpha = rgba[:, :, 3]
+    k = max(3, int(GOLD_FISH_OUTLINE_SIZE))
+    if k % 2 == 0:
+        k += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    outline_alpha = cv2.dilate(alpha, kernel, iterations=1)
+    outline_alpha = cv2.subtract(outline_alpha, alpha)
+    if np.max(outline_alpha) <= 0:
+        return None
+
+    outline = np.zeros_like(rgba)
+    outline[:, :, :3] = (35, 220, 255)
+    outline[:, :, 3] = np.minimum(outline_alpha, GOLD_FISH_OUTLINE_ALPHA).astype(np.uint8)
+    return outline
 
 
 def alpha_blend(frame, rgba, center_x, center_y):
@@ -1564,14 +1638,14 @@ def load_water_grass_sprites():
 
 
 def draw_water_grass(screen):
-    sprites = load_water_grass_sprites()
+    sprites = WATER_GRASS_SPRITES if WATER_GRASS_SPRITES is not None else load_water_grass_sprites()
     if not sprites:
         return
 
     h, w = screen.shape[:2]
     placements = (
-        ("grass1", 0.62, 0.62, 0.28),
-        ("grass2", 0.09, 0.17, 0.29),
+        ("grass1", 0.57, 0.62, 0.33),
+        ("grass2", 0.09, 0.17, 0.34),
     )
     now = time.perf_counter()
     for index, (key, x_ratio, y_ratio, height_ratio) in enumerate(placements):
@@ -1628,7 +1702,7 @@ def draw_fish_shadow(frame, center_x, center_y, sprite_w, sprite_h, radius):
 
 
 def draw_fish_sprite(frame, fish, now):
-    sprites = load_fish_sprites()
+    sprites = FISH_SPRITES if FISH_SPRITES is not None else load_fish_sprites()
     key = _fish_sprite_key(fish)
     sprite = sprites.get(key)
     if sprite is None and key == "bad":
@@ -1662,27 +1736,27 @@ def draw_fish_sprite(frame, fish, now):
         rotated = _rotate_rgba(warped, angle_bucket * FISH_ANGLE_BUCKET_DEG)
         if key == "rare":
             rotated = add_gold_sparkles(rotated, frame_bucket)
-        if len(FISH_RENDER_CACHE) > 160:
-            FISH_RENDER_CACHE.clear()
+        prune_fish_render_cache(frame_bucket)
         FISH_RENDER_CACHE[cache_key] = rotated
 
     shadow_key = _fish_shadow_key(key)
     shadow_sprite = sprites.get(shadow_key)
-    if shadow_sprite is not None:
+    if FISH_SHADOW_ENABLED and shadow_sprite is not None:
         shadow_size_multiplier = GOLD_FISH_SHADOW_SCALE if key == "rare" else 1.0
-        shadow_cache_key = (id(fish), shadow_key, radius, angle_bucket, frame_bucket, shadow_size_multiplier)
+        shadow_frame_bucket = frame_bucket // max(1, int(FISH_SHADOW_ANIMATION_DIVISOR))
+        shadow_cache_key = (id(fish), shadow_key, radius, angle_bucket, shadow_frame_bucket, shadow_size_multiplier)
         shadow_rotated = FISH_RENDER_CACHE.get(shadow_cache_key)
         if shadow_rotated is None:
+            shadow_time = (shadow_frame_bucket * FISH_SHADOW_ANIMATION_DIVISOR) / FISH_ANIMATION_FPS
             shadow_warped = warp_fish_sprite(
                 shadow_sprite,
                 fish,
-                frame_bucket / FISH_ANIMATION_FPS,
+                shadow_time,
                 shadow_key,
                 shadow_size_multiplier,
             )
             shadow_rotated = _rotate_rgba(shadow_warped, angle_bucket * FISH_ANGLE_BUCKET_DEG)
-            if len(FISH_RENDER_CACHE) > 160:
-                FISH_RENDER_CACHE.clear()
+            prune_fish_render_cache(frame_bucket)
             FISH_RENDER_CACHE[shadow_cache_key] = shadow_rotated
         shadow_offset = max(3, int(radius * 0.34))
         alpha_blend(frame, shadow_rotated, float(x) + shadow_offset, float(y) + shadow_offset)
@@ -1712,9 +1786,9 @@ def rebalance_fish_spawn_rates():
         return
 
     spawn_rates = {
-        "normal": 0.54,
-        "red": 0.30,
-        "rare": 0.16,
+        "normal": 0.47,
+        "red": 0.33,
+        "rare": 0.20,
     }
     rate_keys = ("weight", "spawn_weight", "probability", "prob", "chance")
 
