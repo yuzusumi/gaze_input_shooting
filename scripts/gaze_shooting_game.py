@@ -3,7 +3,7 @@ import csv
 import math
 import random
 import time
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +11,11 @@ from pathlib import Path
 import cv2
 import mediapipe as mp
 import numpy as np
+
+try:
+    import pygame
+except ImportError:
+    pygame = None
 
 
 # Landmark IDs used by MediaPipe FaceMesh.
@@ -45,6 +50,15 @@ BACKGROUND_ANIMATION_CACHE = {}
 BACKGROUND_ANIMATION_FRAMES = 8
 BACKGROUND_ANIMATION_FPS = 4.0
 BACKGROUND_DARKEN_ALPHA = 0.82
+POI_SPRITES = None
+POI_RENDER_CACHE = {}
+STATIC_POI_BACKGROUND_CACHE = {}
+POI_SCOOP_TARGET_DIAMETER = 2.05
+POI_CANVAS_MAX_RADIUS_SCALE = 4.8
+POI_LIFT_SEC = 0.22
+POI_LIFT_SCALE = 1.24
+ALPHA_BLEND_PREP_CACHE = {}
+ALPHA_BLEND_PREP_CACHE_MAX = 128
 
 FISH_TYPES = [
     {
@@ -124,6 +138,19 @@ def parse_args():
     parser.add_argument("--ranking-file", type=str, default="gaze_shooting_ranking.csv")
     parser.add_argument("--ranking-size", type=int, default=5)
 
+    parser.add_argument("--bgm-file", type=str, default=None)
+    parser.add_argument("--bgm-volume", type=float, default=0.3)
+    parser.add_argument("--no-bgm", action="store_true")
+    parser.add_argument("--catch-se-file", type=str, default=None)
+    parser.add_argument("--catch-se-volume", type=float, default=1.0)
+    parser.add_argument("--no-catch-se", action="store_true")
+    parser.add_argument("--break-se-file", type=str, default=None)
+    parser.add_argument("--break-se-volume", type=float, default=1.0)
+    parser.add_argument("--no-break-se", action="store_true")
+    parser.add_argument("--clear-se-file", type=str, default=None)
+    parser.add_argument("--clear-se-volume", type=float, default=1.0)
+    parser.add_argument("--no-clear-se", action="store_true")
+
     parser.add_argument("--dead-x", type=float, default=0.6)
     parser.add_argument("--dead-y", type=float, default=0.6)
     parser.add_argument("--x-scale", type=float, default=1.0)
@@ -133,6 +160,7 @@ def parse_args():
     parser.add_argument("--majority-window", type=int, default=1)
 
     parser.add_argument("--fullscreen", action="store_true")
+    parser.add_argument("--profile-report-sec", type=float, default=5.0)
 
     parser.add_argument("--disable-paper-preprocess", action="store_true")
     parser.add_argument("--no-zoom", action="store_true")
@@ -341,19 +369,77 @@ def extract_features(frame, results, smoother=None, smooth_beta=None):
     return feature, info
 
 
-def process_frame(cap, face_mesh, args, smoother=None, smooth_beta=None):
+def process_frame(cap, face_mesh, args, smoother=None, smooth_beta=None, timings=None):
+    t0 = time.perf_counter()
     ret, raw_frame = cap.read()
+    t1 = time.perf_counter()
     if not ret or raw_frame is None:
         return None, None, None
 
     proc_frame = paper_preprocess_frame(raw_frame, args)
+    t2 = time.perf_counter()
     rgb = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
     rgb.flags.writeable = False
     results = face_mesh.process(rgb)
     rgb.flags.writeable = True
+    t3 = time.perf_counter()
 
     feature, info = extract_features(proc_frame, results, smoother=smoother, smooth_beta=smooth_beta)
+    t4 = time.perf_counter()
+    if timings is not None:
+        timings.update({
+            "camera": (t1 - t0) * 1000.0,
+            "preprocess": (t2 - t1) * 1000.0,
+            "mediapipe": (t3 - t2) * 1000.0,
+            "features": (t4 - t3) * 1000.0,
+        })
     return proc_frame, feature, info
+
+
+class PerformanceProfiler:
+    def __init__(self, report_sec=5.0):
+        self.report_sec = max(1.0, float(report_sec))
+        self.started = time.perf_counter()
+        self.frames = 0
+        self.samples = defaultdict(list)
+
+    def add_frame(self, timings):
+        self.frames += 1
+        for name, value in timings.items():
+            self.samples[name].append(float(value))
+
+    def maybe_report(self):
+        now = time.perf_counter()
+        elapsed = now - self.started
+        if elapsed < self.report_sec:
+            return None
+
+        fps = self.frames / elapsed if elapsed > 0 else 0.0
+        order = (
+            "camera", "preprocess", "mediapipe", "features", "update",
+            "logic", "game_draw", "draw_background", "draw_pois",
+            "draw_fish", "draw_grass", "draw_effects", "draw_ui",
+            "debug_draw", "imshow_wait", "frame",
+        )
+        print(f"\n[PERF {elapsed:.1f}s] FPS avg: {fps:.2f}  frames: {self.frames}")
+        print("  section          avg ms   max ms   share")
+        frame_avg = sum(self.samples.get("frame", ())) / max(1, len(self.samples.get("frame", ())))
+        summary = {"fps": fps}
+        for name in order:
+            values = self.samples.get(name)
+            if not values:
+                continue
+            avg = sum(values) / len(values)
+            maximum = max(values)
+            share = (avg / frame_avg * 100.0) if frame_avg > 0 else 0.0
+            print(f"  {name:<14} {avg:7.2f}  {maximum:7.2f}  {share:5.1f}%")
+            summary[name] = avg
+        print("  * share is relative to the average total frame time")
+
+        self.started = now
+        self.frames = 0
+        self.samples.clear()
+        return summary
 
 
 def draw_landmark_view(frame, info):
@@ -649,6 +735,30 @@ def fish_in_poi(fish, w, h, direction, args):
     return math.hypot(fish.x - px, fish.y - py) <= catch_radius
 
 
+def reflect_fish_from_lifted_poi(fish, w, h, args, lifted_direction=None):
+    """Reflect nearby incoming fish when the selected poi is lifted."""
+    if lifted_direction not in AREA_LABELS:
+        return
+
+    px, py = get_poi_center(w, h, lifted_direction)
+    away_x = fish.x - px
+    away_y = fish.y - py
+    distance = math.hypot(away_x, away_y)
+    influence = get_poi_radius(h, args) * 2.35 + fish.radius
+    if distance <= 1e-6 or distance >= influence:
+        return
+
+    away_x /= distance
+    away_y /= distance
+    inward_speed = fish.vx * away_x + fish.vy * away_y
+    if inward_speed >= 0.0:
+        return
+
+    # Reflect the inward velocity component across the radial wall normal.
+    fish.vx -= 2.0 * inward_speed * away_x
+    fish.vy -= 2.0 * inward_speed * away_y
+
+
 def load_background_image():
     global BACKGROUND_IMAGE
     if BACKGROUND_IMAGE is not None:
@@ -729,10 +839,210 @@ def draw_water_background(screen):
     cv2.circle(screen, (w // 2, h // 2), scaled(92, 1080, h), (210, 175, 105), scaled(3, 1080, h), cv2.LINE_AA)
 
 
-def draw_poi(screen, direction, args, selected=False, blink=False, broken=False):
+def ensure_bgra(image):
+    if image is None:
+        return None
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGRA)
+    if image.shape[2] == 3:
+        alpha = np.full(image.shape[:2] + (1,), 255, dtype=np.uint8)
+        return np.concatenate([image, alpha], axis=2)
+    return image
+
+
+def trim_alpha_bounds(image, margin=6):
+    if image is None or image.shape[2] < 4:
+        return image
+    alpha = image[:, :, 3]
+    ys, xs = np.where(alpha > 0)
+    if len(xs) == 0:
+        return image
+    x1 = max(0, int(xs.min()) - margin)
+    y1 = max(0, int(ys.min()) - margin)
+    x2 = min(image.shape[1], int(xs.max()) + margin + 1)
+    y2 = min(image.shape[0], int(ys.max()) + margin + 1)
+    return image[y1:y2, x1:x2].copy()
+
+
+def load_poi_sprites():
+    global POI_SPRITES
+    if POI_SPRITES is not None:
+        return POI_SPRITES
+
+    img_dir = Path(__file__).resolve().parent.parent / "img"
+    files = {
+        0: "blue_poi.png",
+        1: "green_poi.png",
+        2: "red_poi.png",
+        3: "yellow_poi.png",
+    }
+    sprites = {}
+    for direction, filename in files.items():
+        sprite = ensure_bgra(cv2.imread(str(img_dir / filename), cv2.IMREAD_UNCHANGED))
+        if sprite is None:
+            continue
+        sprite = trim_alpha_bounds(sprite)
+        sprites[direction] = sprite
+
+    POI_SPRITES = sprites
+    return POI_SPRITES
+
+
+def get_poi_scoop_bounds(sprite):
+    alpha = sprite[:, :, 3]
+    ys, xs = np.where(alpha > 16)
+    if len(xs) == 0:
+        h, w = sprite.shape[:2]
+        return 0, 0, w, h
+
+    full_x1, full_x2 = int(xs.min()), int(xs.max()) + 1
+    left_limit = full_x1 + max(1, int((full_x2 - full_x1) * 0.58))
+    left_mask = (alpha[:, :left_limit] > 16)
+    left_ys, left_xs = np.where(left_mask)
+    if len(left_xs) == 0:
+        return full_x1, int(ys.min()), left_limit, int(ys.max()) + 1
+    return int(left_xs.min()), int(left_ys.min()), int(left_xs.max()) + 1, int(left_ys.max()) + 1
+
+
+def render_poi_sprite(direction, target_radius, selected=False, blink=False, broken=False, inactive=False, submerged=False):
+    sprites = load_poi_sprites()
+    sprite = sprites.get(direction)
+    if sprite is None:
+        return None
+
+    cache_key = (direction, int(target_radius), bool(selected), bool(broken), bool(inactive), bool(submerged))
+    cached = POI_RENDER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    sx1, sy1, sx2, sy2 = get_poi_scoop_bounds(sprite)
+    scoop_w = max(1, sx2 - sx1)
+    scoop_h = max(1, sy2 - sy1)
+    scoop_diameter = max(scoop_w, scoop_h)
+    target_diameter = max(12, int(target_radius * POI_SCOOP_TARGET_DIAMETER))
+    scale = target_diameter / float(scoop_diameter)
+    if selected:
+        scale *= 1.08
+
+    src_h, src_w = sprite.shape[:2]
+    resized_w = max(8, int(src_w * scale))
+    resized_h = max(8, int(src_h * scale))
+    max_extent = max(48, int(target_radius * POI_CANVAS_MAX_RADIUS_SCALE))
+    if max(resized_w, resized_h) > max_extent:
+        limit_scale = max_extent / float(max(resized_w, resized_h))
+        scale *= limit_scale
+        resized_w = max(8, int(src_w * scale))
+        resized_h = max(8, int(src_h * scale))
+    resized = cv2.resize(sprite, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+
+    scoop_cx = ((sx1 + sx2) * 0.5) * scale
+    scoop_cy = ((sy1 + sy2) * 0.5) * scale
+    pad = int(max(resized_w, resized_h, target_diameter) * 0.35)
+    canvas_w = resized_w + pad * 2
+    canvas_h = resized_h + pad * 2
+    center_x = canvas_w // 2
+    center_y = canvas_h // 2
+    canvas = np.zeros((canvas_h, canvas_w, 4), dtype=np.uint8)
+    x1 = int(round(center_x - scoop_cx))
+    y1 = int(round(center_y - scoop_cy))
+    canvas[y1:y1 + resized_h, x1:x1 + resized_w] = resized
+    # The circular paper is submerged below the fish; only the handle is above
+    # the fish. Use the scoop geometry instead of a hard vertical image split.
+    scoop_canvas = canvas.copy()
+    handle_canvas = canvas.copy()
+    yy, xx = np.ogrid[:canvas_h, :canvas_w]
+    scoop_rx = max(1.0, scoop_w * scale * 0.5)
+    scoop_ry = max(1.0, scoop_h * scale * 0.5)
+    normalized_radius = (
+        ((xx - center_x) / scoop_rx) ** 2
+        + ((yy - center_y) / scoop_ry) ** 2
+    )
+    # Keep a short section of the handle submerged with the circular paper.
+    # The foreground handle begins slightly beyond the circle/handle junction.
+    submerged_handle_end_x = center_x + scoop_rx * 1.02
+    scoop_mask = (normalized_radius <= 1.08 ** 2) | (xx <= submerged_handle_end_x)
+    handle_mask = np.broadcast_to(xx >= submerged_handle_end_x, (canvas_h, canvas_w))
+    scoop_canvas[~scoop_mask] = 0
+    handle_canvas[~handle_mask] = 0
+
+    # Original images have the scoop on the left. Rotate that left vector toward screen center.
+    poi_x, poi_y = get_poi_center(2, 2, direction)
+    center_vec_x = 0.5 - poi_x
+    center_vec_y = 0.5 - poi_y
+    target_angle = math.degrees(math.atan2(center_vec_y, center_vec_x))
+    rotation_angle = -(target_angle - 180.0)
+    scoop_rotated = _rotate_rgba(scoop_canvas, rotation_angle)
+    handle_rotated = _rotate_rgba(handle_canvas, rotation_angle)
+
+    if inactive:
+        for rotated in (scoop_rotated, handle_rotated):
+            overlay_alpha = rotated[:, :, 3]
+            mask = overlay_alpha > 0
+            if np.any(mask):
+                gray = cv2.cvtColor(rotated[:, :, :3], cv2.COLOR_BGR2GRAY)
+                rotated[:, :, 0] = gray
+                rotated[:, :, 1] = gray
+                rotated[:, :, 2] = gray
+                rotated[:, :, 3] = (overlay_alpha.astype(np.float32) * 0.58).astype(np.uint8)
+
+    if submerged and not inactive and not broken:
+        tint = np.array([255, 170, 70], dtype=np.uint8)
+        for rotated in (scoop_rotated, handle_rotated):
+            overlay_alpha = rotated[:, :, 3]
+            mask = overlay_alpha > 0
+            if np.any(mask):
+                rotated[:, :, :3][mask] = (
+                    rotated[:, :, :3][mask].astype(np.float32) * 0.72 + tint * 0.28
+                ).astype(np.uint8)
+
+    if selected or blink or broken:
+        for rotated in (scoop_rotated, handle_rotated):
+            overlay_alpha = rotated[:, :, 3]
+            if np.max(overlay_alpha) > 0:
+                if broken:
+                    tint = np.array([80, 80, 80], dtype=np.uint8)
+                    rotated[:, :, :3] = (rotated[:, :, :3].astype(np.float32) * 0.55 + tint * 0.45).astype(np.uint8)
+    if broken:
+        cx, cy = scoop_rotated.shape[1] // 2, scoop_rotated.shape[0] // 2
+        x_size = max(8, int(target_radius * 0.55))
+        cv2.line(scoop_rotated, (cx - x_size, cy - x_size), (cx + x_size, cy + x_size), (40, 40, 230, 220), max(3, int(target_radius * 0.08)), cv2.LINE_AA)
+        cv2.line(scoop_rotated, (cx + x_size, cy - x_size), (cx - x_size, cy + x_size), (40, 40, 230, 220), max(3, int(target_radius * 0.08)), cv2.LINE_AA)
+
+    whole_rotated = scoop_rotated.copy()
+    handle_pixels = handle_rotated[:, :, 3] > 0
+    whole_rotated[handle_pixels] = handle_rotated[handle_pixels]
+    scoop_rotated = trim_rgba_keep_center(scoop_rotated, margin=max(4, int(target_radius * 0.04)))
+    handle_rotated = trim_rgba_keep_center(handle_rotated, margin=max(4, int(target_radius * 0.04)))
+    whole_rotated = trim_rgba_keep_center(whole_rotated, margin=max(4, int(target_radius * 0.04)))
+    POI_RENDER_CACHE[cache_key] = (scoop_rotated, handle_rotated, whole_rotated)
+    return POI_RENDER_CACHE[cache_key]
+
+
+def draw_poi(screen, direction, args, selected=False, blink=False, broken=False, layer="all", lifted=False):
     h, w = screen.shape[:2]
     cx, cy = get_poi_center(w, h, direction)
     r = get_poi_radius(h, args)
+    if lifted and selected:
+        r = int(r * POI_LIFT_SCALE)
+    sprites = render_poi_sprite(
+        direction,
+        r,
+        selected=selected,
+        blink=(blink and selected),
+        broken=broken,
+        inactive=not selected,
+        submerged=(selected and not lifted),
+    )
+    if sprites is not None:
+        scoop_sprite, handle_sprite, whole_sprite = sprites
+        if layer == "all":
+            alpha_blend(screen, whole_sprite, cx, cy)
+        elif layer == "scoop":
+            alpha_blend(screen, scoop_sprite, cx, cy)
+        elif layer == "handle":
+            alpha_blend(screen, handle_sprite, cx, cy)
+        return
+
     th = scaled(5, 1080, h)
     color = (255, 255, 255)
     rim = (0, 255, 255) if selected else (235, 235, 220)
@@ -782,17 +1092,109 @@ def draw_poi(screen, direction, args, selected=False, blink=False, broken=False)
     )
 
 
-def draw_all_pois(screen, selected_direction, args, blink=False, broken_pois=None):
+def draw_all_pois(screen, selected_direction, args, blink=False, broken_pois=None,
+                  layer="all", poi_lift_until=None, directions=None):
     broken_pois = broken_pois or set()
-    for direction in (0, 1, 2, 3):
+    poi_lift_until = poi_lift_until or {}
+    now = time.perf_counter()
+    if directions is None:
+        directions = range(4)
+    for direction in directions:
+        selected = direction == selected_direction
+        lifted = selected and now < poi_lift_until.get(direction, 0.0)
         draw_poi(
             screen,
             direction,
             args,
-            selected=(direction == selected_direction),
+            selected=selected,
             blink=blink,
             broken=direction in broken_pois,
+            layer=layer,
+            lifted=lifted,
         )
+
+
+def draw_cached_gray_pois(screen, args, broken_pois=None):
+    """Copy a background frame with all inactive gray pois already composited."""
+    h, w = screen.shape[:2]
+    background_frame = int(time.perf_counter() * BACKGROUND_ANIMATION_FPS) % BACKGROUND_ANIMATION_FRAMES
+    cache_key = (
+        w, h, background_frame, int(args.poi_radius),
+    )
+    cached = STATIC_POI_BACKGROUND_CACHE.get(cache_key)
+    if cached is None:
+        cached = screen.copy()
+        draw_all_pois(
+            cached,
+            None,
+            args,
+            layer="all",
+            directions=range(4),
+        )
+        STATIC_POI_BACKGROUND_CACHE[cache_key] = cached
+    screen[:, :] = cached
+
+
+def draw_broken_poi_marks(screen, broken_pois, args):
+    if not broken_pois:
+        return
+    h, w = screen.shape[:2]
+    mark_radius = max(12, int(get_poi_radius(h, args) * 0.55))
+    thickness = max(4, int(get_poi_radius(h, args) * 0.09))
+    for direction in broken_pois:
+        cx, cy = get_poi_center(w, h, direction)
+        cv2.line(
+            screen, (cx - mark_radius, cy - mark_radius),
+            (cx + mark_radius, cy + mark_radius),
+            (35, 35, 235), thickness, cv2.LINE_AA,
+        )
+        cv2.line(
+            screen, (cx + mark_radius, cy - mark_radius),
+            (cx - mark_radius, cy + mark_radius),
+            (35, 35, 235), thickness, cv2.LINE_AA,
+        )
+
+
+def prebuild_render_caches(args):
+    h, w = int(args.screen_height), int(args.screen_width)
+    if h <= 0 or w <= 0:
+        return
+
+    screen = np.zeros((h, w, 3), dtype=np.uint8)
+    draw_water_background(screen)
+    draw_cached_gray_pois(screen, args)
+    draw_water_grass(screen)
+    load_fish_sprites()
+    load_poi_sprites()
+
+    base_radius = get_poi_radius(h, args)
+    lift_radius = int(base_radius * POI_LIFT_SCALE)
+    for direction in range(4):
+        for broken in (False, True):
+            render_poi_sprite(
+                direction,
+                base_radius,
+                selected=False,
+                broken=broken,
+                inactive=True,
+                submerged=False,
+            )
+            render_poi_sprite(
+                direction,
+                base_radius,
+                selected=True,
+                broken=broken,
+                inactive=False,
+                submerged=True,
+            )
+            render_poi_sprite(
+                direction,
+                lift_radius,
+                selected=True,
+                broken=broken,
+                inactive=False,
+                submerged=False,
+            )
 
 
 def draw_fish(screen, fish, now):
@@ -926,20 +1328,96 @@ def draw_effects(screen, effects):
         cv2.circle(screen, (int(effect["x"]), int(effect["y"])), int(scaled(70, 1080, h) * (1.0 + t)), effect["color"], scaled(3, 1080, h), cv2.LINE_AA)
 
 
+def draw_perf_overlay(screen, perf, fps, fish_count):
+    if not perf:
+        return
+
+    h, w = screen.shape[:2]
+    scale = 0.52 * h / 1080
+    thickness = max(1, scaled(1, 1080, h))
+    line_h = scaled(22, 1080, h)
+    x = scaled(18, 1920, w)
+    y = h - scaled(170, 1080, h)
+    lines = [
+        f"FPS {fps:.1f}  fish {fish_count}  cache {len(FISH_RENDER_CACHE)}",
+        f"update {perf.get('update_ms', 0.0):5.1f} ms",
+        f"camera/gaze {perf.get('process_ms', 0.0):5.1f} ms",
+        f"logic {perf.get('logic_ms', 0.0):5.1f} ms",
+        f"draw {perf.get('draw_ms', 0.0):5.1f} ms",
+        f"imshow+wait {perf.get('show_wait_ms', 0.0):5.1f} ms",
+        f"frame {perf.get('frame_ms', 0.0):5.1f} ms",
+    ]
+    box_w = scaled(310, 1920, w)
+    box_h = line_h * len(lines) + scaled(16, 1080, h)
+    overlay = screen.copy()
+    cv2.rectangle(overlay, (x - 8, y - line_h), (x + box_w, y + box_h - line_h), (20, 35, 45), -1)
+    cv2.addWeighted(overlay, 0.58, screen, 0.42, 0, screen)
+    for i, text in enumerate(lines):
+        cv2.putText(
+            screen,
+            text,
+            (x, y + i * line_h),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            (235, 250, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
 def draw_game_screen(w, h, fishes, selected_direction, score, remain_sec, args,
-                     blink=False, head_warning=False, effects=None, broken_pois=None):
+                     blink=False, head_warning=False, effects=None, broken_pois=None,
+                     poi_lift_until=None, timings=None):
+    t0 = time.perf_counter()
     screen = np.zeros((h, w, 3), dtype=np.uint8)
     draw_water_background(screen)
-    draw_all_pois(screen, selected_direction, args, blink=blink, broken_pois=broken_pois)
+    draw_cached_gray_pois(screen, args, broken_pois=broken_pois)
+    t_background = time.perf_counter()
 
     now = time.perf_counter()
+    selected_lifted = (
+        selected_direction in AREA_LABELS
+        and now < (poi_lift_until or {}).get(selected_direction, 0.0)
+    )
+    if (selected_direction in AREA_LABELS and not selected_lifted
+            and selected_direction not in (broken_pois or set())):
+        draw_all_pois(
+            screen,
+            selected_direction,
+            args,
+            blink=blink,
+            broken_pois=broken_pois,
+            layer="all",
+            poi_lift_until=poi_lift_until,
+            directions=(selected_direction,),
+        )
+    t_poi_scoop = time.perf_counter()
+
     for fish in fishes:
         draw_fish(screen, fish, now)
+    t_fish = time.perf_counter()
 
     draw_water_grass(screen)
+    t_grass = time.perf_counter()
+
+    if selected_lifted:
+        draw_all_pois(
+            screen,
+            selected_direction,
+            args,
+            blink=blink,
+            broken_pois=broken_pois,
+            layer="all",
+            poi_lift_until=poi_lift_until,
+            directions=(selected_direction,),
+        )
+    t_poi_handle = time.perf_counter()
 
     if effects is not None:
         draw_effects(screen, effects)
+    t_effects = time.perf_counter()
+
+    draw_broken_poi_marks(screen, broken_pois, args)
 
     panel_h = scaled(86, 1080, h)
     cv2.rectangle(screen, (0, 0), (w, panel_h), (45, 70, 55), -1)
@@ -961,8 +1439,104 @@ def draw_game_screen(w, h, fishes, selected_direction, score, remain_sec, args,
         draw_centered_text(screen, "Please keep your head still", h - scaled(95, 1080, h), color=(0, 0, 255), scale=1.0 * h / 1080, thickness=scaled(3, 1080, h))
 
     put_text(screen, "Look LEFT UP / RIGHT UP / LEFT DOWN / RIGHT DOWN, blink when a fish enters the poi.  Press q to quit", h - scaled(35, 1080, h), color=(255, 255, 255), scale=0.66 * h / 1080, thickness=scaled(2, 1080, h))
+    t_ui = time.perf_counter()
+    if timings is not None:
+        timings.update({
+            "draw_background": (t_background - t0) * 1000.0,
+            "draw_pois": ((t_poi_scoop - t_background) + (t_poi_handle - t_grass)) * 1000.0,
+            "draw_fish": (t_fish - t_poi_scoop) * 1000.0,
+            "draw_grass": (t_grass - t_fish) * 1000.0,
+            "draw_effects": (t_effects - t_poi_handle) * 1000.0,
+            "draw_ui": (t_ui - t_effects) * 1000.0,
+        })
     return screen
 
+
+
+def _audio_path(custom_path, default_name):
+    if custom_path:
+        path = Path(custom_path)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent.parent / path
+        return path
+    return Path(__file__).resolve().parent.parent / "audio" / default_name
+
+
+CATCH_SE_SOUND = None
+BREAK_SE_SOUND = None
+CLEAR_SE_SOUND = None
+
+
+def _load_sound(path, volume):
+    if not path.exists():
+        print(f"[WARN] Sound effect file not found: {path}")
+        return None
+    try:
+        sound = pygame.mixer.Sound(str(path))
+        sound.set_volume(max(0.0, min(1.0, volume)))
+        return sound
+    except Exception as e:
+        print(f"[WARN] Could not load sound effect {path}: {e}")
+        return None
+
+
+def init_audio(args):
+    global CATCH_SE_SOUND, BREAK_SE_SOUND, CLEAR_SE_SOUND
+
+    any_audio_enabled = not (
+        args.no_bgm and args.no_catch_se and args.no_break_se and args.no_clear_se
+    )
+    if pygame is None:
+        if any_audio_enabled:
+            print("[WARN] pygame is not installed; BGM/SE disabled.")
+        return
+
+    if any_audio_enabled:
+        try:
+            pygame.mixer.init()
+        except Exception as e:
+            print(f"[WARN] Could not initialize audio mixer: {e}")
+            return
+
+    if not args.no_bgm:
+        path = _audio_path(args.bgm_file, "bgm.wav")
+        if not path.exists():
+            print(f"[WARN] BGM file not found: {path}")
+        else:
+            try:
+                pygame.mixer.music.load(str(path))
+                pygame.mixer.music.set_volume(max(0.0, min(1.0, args.bgm_volume)))
+                pygame.mixer.music.play(loops=-1)
+            except Exception as e:
+                print(f"[WARN] Could not play BGM: {e}")
+
+    if not args.no_catch_se:
+        CATCH_SE_SOUND = _load_sound(
+            _audio_path(args.catch_se_file, "catch_se.mp3"), args.catch_se_volume
+        )
+    if not args.no_break_se:
+        BREAK_SE_SOUND = _load_sound(
+            _audio_path(args.break_se_file, "break_se.mp3"), args.break_se_volume
+        )
+    if not args.no_clear_se:
+        CLEAR_SE_SOUND = _load_sound(
+            _audio_path(args.clear_se_file, "clear_se.mp3"), args.clear_se_volume
+        )
+
+
+def play_catch_se():
+    if CATCH_SE_SOUND is not None:
+        CATCH_SE_SOUND.play()
+
+
+def play_break_se():
+    if BREAK_SE_SOUND is not None:
+        BREAK_SE_SOUND.play()
+
+
+def play_clear_se():
+    if CLEAR_SE_SOUND is not None:
+        CLEAR_SE_SOUND.play()
 
 
 def get_ranking_path(args):
@@ -1106,12 +1680,16 @@ def main():
         print("[ERROR] Camera could not be opened.")
         return
 
+    init_audio(args)
+
     cv2.namedWindow("gaze_shooting", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("gaze_shooting", args.screen_width, args.screen_height)
     cv2.namedWindow("camera_landmarks", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("camera_landmarks", 640, 480)
     if args.fullscreen:
         cv2.setWindowProperty("gaze_shooting", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    prebuild_render_caches(args)
 
     mp_face_mesh = mp.solutions.face_mesh
     calib_smoother = LandmarkSmoother()
@@ -1163,11 +1741,6 @@ def main():
             if center_info is None:
                 center_info = baseline_info
 
-            try:
-                cv2.destroyWindow("camera_landmarks")
-            except cv2.error:
-                pass
-
             base_eye_x = center_info["eye_center_x"]
             base_eye_y = center_info["eye_center_y"]
             base_eye_dist = center_info["inter_eye_dist"]
@@ -1182,6 +1755,7 @@ def main():
             fishes = spawn_initial_fishes(args.screen_width, args.screen_height, initial_fish_count)
             effects = []
             broken_pois = set()
+            poi_lift_until = {}
             last_spawn_time = time.perf_counter()
             last_bad_spawn_time = time.perf_counter()
             prev_frame_time = time.perf_counter()
@@ -1190,8 +1764,11 @@ def main():
             fps_start = time.perf_counter()
             fps_frames = 0
             fps = 0.0
+            perf = {}
+            profiler = PerformanceProfiler(args.profile_report_sec)
 
             while True:
+                frame_t0 = time.perf_counter()
                 game_elapsed = time.perf_counter() - game_start_time
                 game_remain = game_elapsed if args.no_time_limit else max(0.0, args.game_sec - game_elapsed)
                 if (not args.no_time_limit) and game_elapsed >= args.game_sec:
@@ -1209,8 +1786,13 @@ def main():
                     last_spawn_time,
                     last_bad_spawn_time,
                 )
+                update_done = time.perf_counter()
 
-                frame, feature, info = process_frame(cap, face_mesh, args, realtime_smoother, args.realtime_beta)
+                frame_timings = {}
+                frame, feature, info = process_frame(
+                    cap, face_mesh, args, realtime_smoother, args.realtime_beta, frame_timings
+                )
+                process_done = time.perf_counter()
 
                 dx, dy = calc_offset_xy(feature, center_feature, args)
                 head_warning = False
@@ -1228,6 +1810,12 @@ def main():
                     blink_trigger = blink_now and not prev_blink
 
                     if blink_trigger and last_valid_area is not None and last_valid_area not in broken_pois:
+                        poi_lift_until[last_valid_area] = time.perf_counter() + POI_LIFT_SEC
+                        for fish in fishes:
+                            reflect_fish_from_lifted_poi(
+                                fish, args.screen_width, args.screen_height,
+                                args, last_valid_area,
+                            )
                         hit_fishes = [
                             fish
                             for fish in fishes
@@ -1240,9 +1828,11 @@ def main():
                                     score += BAD_FISH_PENALTY
                                     caught_bad = True
                                     add_miss_effect(effects, hit_fish, args)
+                                    play_break_se()
                                 else:
                                     score += hit_fish.score
                                     add_catch_effect(effects, hit_fish, args)
+                                    play_catch_se()
                             if caught_bad:
                                 broken_pois.add(last_valid_area)
 
@@ -1265,7 +1855,9 @@ def main():
                     prev_blink = blink_now
                 else:
                     prev_blink = False
+                logic_done = time.perf_counter()
 
+                draw_timings = {}
                 screen = draw_game_screen(
                     args.screen_width,
                     args.screen_height,
@@ -1278,7 +1870,13 @@ def main():
                     head_warning=head_warning,
                     effects=effects,
                     broken_pois=broken_pois,
+                    poi_lift_until=poi_lift_until,
+                    timings=draw_timings,
                 )
+                draw_done = time.perf_counter()
+
+                debug_view = draw_landmark_view(frame, info)
+                debug_draw_done = time.perf_counter()
 
                 fps_frames += 1
                 now = time.perf_counter()
@@ -1289,15 +1887,41 @@ def main():
                     fps_start = now
                     fps_frames = 0
 
+                perf = {
+                    "update_ms": (update_done - now_frame) * 1000.0,
+                    "process_ms": (process_done - update_done) * 1000.0,
+                    "logic_ms": (logic_done - process_done) * 1000.0,
+                    "draw_ms": (draw_done - logic_done) * 1000.0,
+                    "show_wait_ms": perf.get("show_wait_ms", 0.0),
+                    "frame_ms": perf.get("frame_ms", 0.0),
+                }
+                draw_perf_overlay(screen, perf, fps, len(fishes))
                 cv2.imshow("gaze_shooting", screen)
+                if debug_view is not None:
+                    cv2.imshow("camera_landmarks", debug_view)
 
                 key = cv2.waitKey(1) & 0xFF
+                wait_done = time.perf_counter()
+                perf["show_wait_ms"] = (wait_done - draw_done) * 1000.0
+                perf["frame_ms"] = (wait_done - frame_t0) * 1000.0
+                profiler.add_frame({
+                    **frame_timings,
+                    **draw_timings,
+                    "update": (update_done - now_frame) * 1000.0,
+                    "logic": (logic_done - process_done) * 1000.0,
+                    "game_draw": (draw_done - logic_done) * 1000.0,
+                    "debug_draw": (debug_draw_done - draw_done) * 1000.0,
+                    "imshow_wait": (wait_done - debug_draw_done) * 1000.0,
+                    "frame": (wait_done - frame_t0) * 1000.0,
+                })
+                profiler.maybe_report()
                 if key == ord("q"):
                     cap.release()
                     cv2.destroyAllWindows()
                     return
 
             rankings = add_ranking_score(score, args)
+            play_clear_se()
 
             while True:
                 cv2.imshow("gaze_shooting", draw_time_up_screen(args.screen_width, args.screen_height, score, rankings))
@@ -1319,11 +1943,11 @@ FISH_RESIZED_SPRITE_CACHE = {}
 FISH_WARP_GRID_CACHE = {}
 FISH_RENDER_CACHE = {}
 FISH_RENDER_CACHE_MAX = 160
-FISH_ANIMATION_FPS = 8.0
+FISH_ANIMATION_FPS = 10.0
 FISH_ANGLE_BUCKET_DEG = 8.0
-FISH_WIGGLE_SPEED = 2.35
-FISH_WIGGLE_SPEED_BY_MOVE = 0.18
-FISH_WIGGLE_SPEED_MAX_BONUS = 1.8
+FISH_WIGGLE_SPEED = 3.4
+FISH_WIGGLE_SPEED_BY_MOVE = 0.28
+FISH_WIGGLE_SPEED_MAX_BONUS = 2.8
 FISH_WIGGLE_BODY_WAVE = 1.05
 FISH_COLOR_SATURATION_SCALE = 1.12
 FISH_COLOR_VALUE_SCALE = 0.96
@@ -1460,10 +2084,8 @@ def prune_fish_render_cache(current_frame_bucket):
         FISH_RENDER_CACHE.clear()
 
 
-def warp_fish_sprite(sprite, fish, now, cache_sprite_key=None, size_multiplier=1.0):
-    radius = max(8, int(_fish_value(fish, "radius", 24)))
+def resize_fish_sprite_cached(sprite, sprite_key, radius, size_multiplier=1.0):
     src_h, src_w = sprite.shape[:2]
-    sprite_key = cache_sprite_key or _fish_sprite_key(fish)
     size_scale = 4.6 if str(sprite_key).startswith("bad") else 3.8
     target_h = max(14, int(radius * size_scale * size_multiplier))
     target_w = max(8, int(target_h * src_w / max(1, src_h)))
@@ -1473,6 +2095,13 @@ def warp_fish_sprite(sprite, fish, now, cache_sprite_key=None, size_multiplier=1
     if resized is None:
         resized = cv2.resize(sprite, (target_w, target_h), interpolation=cv2.INTER_AREA)
         FISH_RESIZED_SPRITE_CACHE[resized_key] = resized
+    return resized
+
+
+def warp_fish_sprite(sprite, fish, now, cache_sprite_key=None, size_multiplier=1.0):
+    radius = max(8, int(_fish_value(fish, "radius", 24)))
+    sprite_key = cache_sprite_key or _fish_sprite_key(fish)
+    resized = resize_fish_sprite_cached(sprite, sprite_key, radius, size_multiplier)
 
     h, w = resized.shape[:2]
     grid = FISH_WARP_GRID_CACHE.get((w, h))
@@ -1580,6 +2209,31 @@ def make_gold_outline(rgba):
     return outline
 
 
+def trim_rgba_keep_center(rgba, margin=4):
+    if rgba is None or rgba.size == 0 or rgba.shape[2] < 4:
+        return rgba
+
+    alpha = rgba[:, :, 3]
+    ys, xs = np.where(alpha > 0)
+    if len(xs) == 0:
+        return rgba
+
+    h, w = rgba.shape[:2]
+    cx = w / 2.0
+    cy = h / 2.0
+    margin = max(0, int(margin))
+    half_w = int(math.ceil(max(cx - xs.min(), xs.max() + 1 - cx))) + margin
+    half_h = int(math.ceil(max(cy - ys.min(), ys.max() + 1 - cy))) + margin
+
+    x1 = max(0, int(round(cx - half_w)))
+    x2 = min(w, int(round(cx + half_w)))
+    y1 = max(0, int(round(cy - half_h)))
+    y2 = min(h, int(round(cy + half_h)))
+    if x1 <= 0 and y1 <= 0 and x2 >= w and y2 >= h:
+        return rgba
+    return rgba[y1:y2, x1:x2].copy()
+
+
 def alpha_blend(frame, rgba, center_x, center_y):
     if rgba is None or rgba.size == 0 or rgba.shape[2] < 4:
         return False
@@ -1603,14 +2257,24 @@ def alpha_blend(frame, rgba, center_x, center_y):
     sprite_x2 = sprite_x1 + (roi_x2 - roi_x1)
     sprite_y2 = sprite_y1 + (roi_y2 - roi_y1)
 
-    sprite_roi = rgba[sprite_y1:sprite_y2, sprite_x1:sprite_x2]
-    alpha = sprite_roi[:, :, 3:4].astype(np.uint16)
-    if np.max(alpha) <= 0:
+    cache_key = id(rgba)
+    prepared = ALPHA_BLEND_PREP_CACHE.get(cache_key)
+    if prepared is None or prepared[0] is not rgba:
+        alpha_full = rgba[:, :, 3:4].astype(np.uint16)
+        premultiplied_full = rgba[:, :, :3].astype(np.uint16) * alpha_full
+        inverse_alpha_full = 255 - alpha_full
+        if len(ALPHA_BLEND_PREP_CACHE) >= ALPHA_BLEND_PREP_CACHE_MAX:
+            ALPHA_BLEND_PREP_CACHE.pop(next(iter(ALPHA_BLEND_PREP_CACHE)))
+        prepared = (rgba, premultiplied_full, inverse_alpha_full)
+        ALPHA_BLEND_PREP_CACHE[cache_key] = prepared
+
+    premultiplied = prepared[1][sprite_y1:sprite_y2, sprite_x1:sprite_x2]
+    inverse_alpha = prepared[2][sprite_y1:sprite_y2, sprite_x1:sprite_x2]
+    if np.min(inverse_alpha) >= 255:
         return False
 
     frame_roi = frame[roi_y1:roi_y2, roi_x1:roi_x2].astype(np.uint16)
-    sprite_rgb = sprite_roi[:, :, :3].astype(np.uint16)
-    blended = (sprite_rgb * alpha + frame_roi * (255 - alpha) + 127) // 255
+    blended = (premultiplied + frame_roi * inverse_alpha + 127) // 255
     frame[roi_y1:roi_y2, roi_x1:roi_x2] = blended.astype(np.uint8)
     return True
 
@@ -1736,6 +2400,7 @@ def draw_fish_sprite(frame, fish, now):
         rotated = _rotate_rgba(warped, angle_bucket * FISH_ANGLE_BUCKET_DEG)
         if key == "rare":
             rotated = add_gold_sparkles(rotated, frame_bucket)
+        rotated = trim_rgba_keep_center(rotated, margin=max(3, int(radius * 0.16)))
         prune_fish_render_cache(frame_bucket)
         FISH_RENDER_CACHE[cache_key] = rotated
 
@@ -1743,19 +2408,17 @@ def draw_fish_sprite(frame, fish, now):
     shadow_sprite = sprites.get(shadow_key)
     if FISH_SHADOW_ENABLED and shadow_sprite is not None:
         shadow_size_multiplier = GOLD_FISH_SHADOW_SCALE if key == "rare" else 1.0
-        shadow_frame_bucket = frame_bucket // max(1, int(FISH_SHADOW_ANIMATION_DIVISOR))
-        shadow_cache_key = (id(fish), shadow_key, radius, angle_bucket, shadow_frame_bucket, shadow_size_multiplier)
+        shadow_cache_key = (shadow_key, radius, angle_bucket, shadow_size_multiplier)
         shadow_rotated = FISH_RENDER_CACHE.get(shadow_cache_key)
         if shadow_rotated is None:
-            shadow_time = (shadow_frame_bucket * FISH_SHADOW_ANIMATION_DIVISOR) / FISH_ANIMATION_FPS
-            shadow_warped = warp_fish_sprite(
+            shadow_resized = resize_fish_sprite_cached(
                 shadow_sprite,
-                fish,
-                shadow_time,
                 shadow_key,
+                radius,
                 shadow_size_multiplier,
             )
-            shadow_rotated = _rotate_rgba(shadow_warped, angle_bucket * FISH_ANGLE_BUCKET_DEG)
+            shadow_rotated = _rotate_rgba(shadow_resized, angle_bucket * FISH_ANGLE_BUCKET_DEG)
+            shadow_rotated = trim_rgba_keep_center(shadow_rotated, margin=max(3, int(radius * 0.16)))
             prune_fish_render_cache(frame_bucket)
             FISH_RENDER_CACHE[shadow_cache_key] = shadow_rotated
         shadow_offset = max(3, int(radius * 0.34))
